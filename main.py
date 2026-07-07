@@ -39,7 +39,9 @@ def init_db():
         )
     """)
     
-    # DAFTAR KOMIK TARGET (Menggunakan Komikcast)
+    # =========================================================================
+    # DAFTAR KOMIK TARGET (HANYA YANG MAU KAMU TRACK)
+    # =========================================================================
     target_komik = [
         (
             'Became The Patron Of Villains', 
@@ -50,20 +52,15 @@ def init_db():
             'Job Change Log', 
             '0', 
             'https://komikcast.bz/komik/the-job-change-log/'
-        ),
-        (
-            'One Piece',
-            '0',
-            'https://komikcast.bz/komik/one-piece/'
-        ),
-        (
-            'Black Clover',
-            '0',
-            'https://komikcast.bz/komik/black-clover/'
         )
     ]
     
-    # Menggunakan DO UPDATE SET agar URL lama yang rusak otomatis ditimpa dengan yang baru
+    # [PENTING] Menghapus komik di database yang tidak terdaftar di list atas lagi
+    titles = [t[0] for t in target_komik]
+    if titles:
+        cursor.execute("DELETE FROM manga_tracks WHERE NOT (title = ANY(%s));", (titles,))
+    
+    # Masukkan atau update komik yang aktif
     for title, last_chapter, url in target_komik:
         cursor.execute("""
             INSERT INTO manga_tracks (title, last_chapter, url)
@@ -82,25 +79,20 @@ def cek_update():
     cursor.execute("SELECT title, last_chapter, url FROM manga_tracks")
     daftar_manga = cursor.fetchall()
 
-    # Bikin objek scraper penembus Cloudflare
     scraper = cloudscraper.create_scraper()
 
     for title, last_chapter, url in daftar_manga:
         try:
-            # verify=False Dihapus karena cloudscraper sudah menghandle SSL dengan aman secara native
             respon = scraper.get(url, timeout=15)
             
             if respon.status_code == 200:
                 soup = BeautifulSoup(respon.text, 'html.parser')
-                
-                # Mengambil tag span class chapnum (Standar Komikcast)
                 chapter_element = soup.find('span', class_='chapnum')
                 
                 if chapter_element:
                     chapter_terbaru = chapter_element.text.strip()
                     print(f"[{title}] DB: {last_chapter} | Web: {chapter_terbaru}")
                     
-                    # Jika baru pertama kali diinput, simpan nomor chapternya tanpa kirim notif
                     if last_chapter == '0':
                         cursor.execute(
                             "UPDATE manga_tracks SET last_chapter = %s WHERE title = %s",
@@ -109,7 +101,6 @@ def cek_update():
                         conn.commit()
                         print(f"-> Menginisialisasi chapter awal {title} ke {chapter_terbaru}")
                     
-                    # Jika mendeteksi ada chapter baru rilis
                     elif chapter_terbaru != last_chapter:
                         pesan = (
                             f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
