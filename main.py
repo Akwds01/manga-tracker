@@ -60,9 +60,8 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url
 
 def cari_komik_komiku(keyword):
-    """Fungsi pencarian multi-layer menggunakan parameter sakti pilihanmu (FIXED TOTAL)"""
+    """Fungsi pencarian multi-layer menggunakan parameter sakti post_type=manga"""
     scraper = cloudscraper.create_scraper()
-    # Penerapan parameter taktis post_type=manga agar search wordpress merespon
     url = f"https://komiku.org/?post_type=manga&s={requests.utils.quote(keyword)}"
     results = []
     try:
@@ -70,7 +69,6 @@ def cari_komik_komiku(keyword):
         if respon.status_code == 200:
             soup = BeautifulSoup(respon.text, 'html.parser')
             
-            # Layer 1: Deteksi via kontainer artikel grid bawaan Komiku
             items = soup.find_all(class_=['bdr', 'manga-item', 'ch', 'core'])
             for item in items:
                 a_tag = item.find('a')
@@ -85,7 +83,6 @@ def cari_komik_komiku(keyword):
                         if len(title) > 2 and not any(r['url'] == href for r in results):
                             results.append({'title': title, 'url': href})
             
-            # Layer 2: Deep Scan seluruh anchor link jika Layer 1 terlewat
             for a_tag in soup.find_all('a'):
                 href = a_tag.get('href', '')
                 if "/manga/" in href:
@@ -173,7 +170,6 @@ def callback_router(call):
         
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="⚡ *Silakan Pilih Metode Penambahan Tracker:*", parse_mode="Markdown", reply_markup=markup)
 
-    # 📋 VIEW DAFTAR TRACKER (UI PERCANTIK TANPA SPAM TOMBOL BERULANG)
     elif call.data == "btn_daftar":
         bot.answer_callback_query(call.id)
         conn = psycopg2.connect(DATABASE_URL)
@@ -193,7 +189,6 @@ def callback_router(call):
                 f"───────────────────────────\n"
         
         for idx, (db_id, title, last_chapter, url) in enumerate(data, 1):
-            # Mengubah judul komik menjadi hyperlink text agar tidak butuh tombol baca lagi
             pesan += f"{idx}. 📖 [{title}]({url})\n     ✨ Posisi: `{last_chapter}`\n\n"
             
         pesan += f"───────────────────────────\n💡 Klik nama judul untuk membaca. Gunakan menu di bawah untuk mengelola database."
@@ -203,9 +198,9 @@ def callback_router(call):
             telebot.types.InlineKeyboardButton(text="🗑️ Manajemen Hapus", callback_data="manage_del"),
             telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home")
         )
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
+        # PERBAIKAN: Parameter disable_web_page_preview dihapus karena tidak didukung di fungsi edit_message_caption
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
 
-    # 🗑️ SUB-MENU MANAJEMEN HAPUS (COMPACT GRID SYSTEM - ANTI SPAM BERBARIS)
     elif call.data == "manage_del":
         bot.answer_callback_query(call.id)
         conn = psycopg2.connect(DATABASE_URL)
@@ -223,12 +218,11 @@ def callback_router(call):
         pesan = "🗑️ *MANAJEMEN PENGHAPUSAN TRACKER*\n" \
                 f"───────────────────────────\n"
         for idx, (db_id, title) in enumerate(data, 1):
-            pesan += f" [{idx}]  *{title}*\n"
+            pesan += f" [{idx}]  *{title}\n"
         pesan += f"───────────────────────────\n🎯 Silakan klik **Angka Nomor Urut** komik di bawah ini untuk menghapusnya dari radar pemantauan:"
 
         markup = telebot.types.InlineKeyboardMarkup()
         
-        # Generator Grid Horizontal Otomatis (Maksimal 5 Kolom per baris agar estetik)
         row_buttons = []
         for idx, (db_id, title) in enumerate(data, 1):
             row_buttons.append(telebot.types.InlineKeyboardButton(text=f" {idx} ", callback_data=f"exec_del_{db_id}"))
@@ -241,7 +235,6 @@ def callback_router(call):
         markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Daftar", callback_data="btn_daftar"))
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
 
-    # 🚯 EKSEKUSI PENGHAPUSAN INDEKS SELECTED
     elif call.data.startswith("exec_del_"):
         db_id = int(call.data.split('_')[2])
         conn = psycopg2.connect(DATABASE_URL)
@@ -255,7 +248,6 @@ def callback_router(call):
         nama_del = deleted[0] if deleted else "Komik"
         bot.answer_callback_query(call.id, f"Sukses Menghapus {nama_del}!", show_alert=False)
         
-        # Melempar kembali ke halaman manajemen hapus biar list angkanya berkurang dinamis
         call.data = "manage_del"
         callback_router(call)
 
