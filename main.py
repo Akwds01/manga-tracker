@@ -99,7 +99,7 @@ def cari_komik_komiku(keyword):
                 if not any(r['url'] == href for r in results):
                     results.append({'title': title, 'url': href})
                     
-        if not Antiquity := results:
+        if not results:
             status_debug = "HTML_EMPTY"
             
     except Exception as e:
@@ -223,7 +223,6 @@ def callback_router(call):
         pesan = "🗑️ *MANAJEMEN PENGHAPUSAN TRACKER*\n" \
                 f"───────────────────────────\n"
         for idx, (db_id, title) in enumerate(data, 1):
-            # FIXED: Menambahkan bintang penutup agar entitas markdown tidak rusak/pecah
             pesan += f" [{idx}]  *{title}*\n"
         pesan += f"───────────────────────────\n🎯 Silakan klik **Angka Nomor Urut** komik di bawah ini untuk menghapusnya dari radar pemantauan:"
 
