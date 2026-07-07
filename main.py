@@ -14,14 +14,10 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Inisialisasi Bot Telegram
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# Kamus sementara untuk menyimpan status input user (State Management)
 user_states = {}
 
 def init_db():
-    """Membuat tabel database multi-user jika belum ada"""
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute("""
@@ -38,31 +34,53 @@ def init_db():
     cursor.close()
     conn.close()
 
+def ekstrak_chapter(html_text):
+    """Fungsi pembantu untuk mendeteksi chapter dari berbagai jenis struktur web"""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    # Kategori 1: Struktur Web Komiku (id='Daftar_Chapter')
+    container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter')
+    if container:
+        first_a = container.find('a')
+        if first_a:
+            return " ".join(first_a.text.strip().split())
+            
+    # Kategori 2: Halaman detail bertema MangaStream/Madara (Komikcast, Bacakomik, Komikindo)
+    container_ms = soup.find(id='chapterlist') or soup.find(class_='cl') or soup.find(class_='clstyle')
+    if container_ms:
+        first_a = container_ms.find('a')
+        if first_a:
+            return " ".join(first_a.text.strip().split())
+
+    # Kategori 3: Pencarian langsung lewat class chapnum (Backup global)
+    chapter_element = soup.find('span', class_='chapnum') or soup.find(class_='chapnum')
+    if chapter_element:
+        return " ".join(chapter_element.text.strip().split())
+        
+    return None
+
 # =========================================================================
-# 🎛️ BAGIAN TOMBOL DAN MENU TELEGRAM (MENU BUTTONS)
+# 🎛️ USER INTERFACE (TELEGRAM BUTTONS & COMMANDS)
 # =========================================================================
 
 def tombol_utama():
-    """Membuat menu tombol di bawah keyboard Telegram"""
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("➕ Tambah Komik", "📋 Daftar Komik")
     return markup
 
 @bot.message_handler(commands=['start', 'help'])
 def kirim_welcome(message):
-    """Menangani perintah /start"""
     nama_user = message.from_user.first_name
     pesan = (
         f"Halo *{nama_user}*! 👋\n\n"
-        "Selamat datang di Bot Tracker Komik otomatis. "
-        "Di sini kamu bisa mendaftarkan komik favoritmu dari web *Komiku* dan bot akan memberikan notifikasi otomatis tiap kali ada chapter baru rilis!\n\n"
+        "Selamat datang di Bot Tracker Komik otomatis.\n"
+        "Bot mendukung link dari *Komiku, Komikcast, Bacakomik, Komikindo*, dll.\n\n"
         "Silakan gunakan tombol di bawah untuk memulai."
     )
     bot.send_message(message.chat.id, pesan, parse_mode="Markdown", reply_markup=tombol_utama())
 
 @bot.message_handler(func=lambda message: message.text == "📋 Daftar Komik")
 def lihat_daftar_komik(message):
-    """Menampilkan daftar komik yang di-add oleh user tersebut"""
     user_id = message.chat.id
     
     conn = psycopg2.connect(DATABASE_URL)
@@ -73,7 +91,7 @@ def lihat_daftar_komik(message):
     conn.close()
     
     if not daftar:
-        bot.send_message(user_id, "❌ Kamu belum menambahkan komik apa pun. Klik tombol *➕ Tambah Komik* untuk memulai!", parse_mode="Markdown")
+        bot.send_message(user_id, "❌ Kamu belum menambahkan komik apa pun. Klik *➕ Tambah Komik* untuk memulai!", parse_mode="Markdown")
         return
         
     pesan = "📋 *Daftar Komik Tracker Kamu:*\n\n"
@@ -84,11 +102,9 @@ def lihat_daftar_komik(message):
 
 @bot.message_handler(func=lambda message: message.text == "➕ Tambah Komik")
 def mulai_tambah_komik(message):
-    """Langkah 1 Tambah Komik: Meminta Judul"""
     user_id = message.chat.id
     user_states[user_id] = {'step': 'menunggu_judul'}
     
-    # Tombol batal jika user ingin membatalkan input
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("❌ Batalkan")
     
@@ -96,7 +112,6 @@ def mulai_tambah_komik(message):
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('step') == 'menunggu_judul')
 def proses_judul_komik(message):
-    """Langkah 2 Tambah Komik: Menyimpan Judul & Meminta URL"""
     user_id = message.chat.id
     teks = message.text.strip()
     
@@ -106,11 +121,10 @@ def proses_judul_komik(message):
         return
         
     user_states[user_id] = {'step': 'menunggu_url', 'title': teks}
-    bot.send_message(user_id, f"Judul diterima: *{teks}*\n\nSekarang, kirim *URL/Link halaman utama komik tersebut* dari website Komiku (Contoh: https://komiku.org/manga/judul-komik/):", parse_mode="Markdown")
+    bot.send_message(user_id, f"Judul diterima: *{teks}*\n\nSekarang, kirim *URL/Link utama komik tersebut* (Contoh: https://komiku.org/manga/judul-komik/):", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('step') == 'menunggu_url')
 def proses_url_komik(message):
-    """Langkah 3 Tambah Komik: Menyimpan ke Database"""
     user_id = message.chat.id
     url_input = message.text.strip()
     
@@ -120,30 +134,62 @@ def proses_url_komik(message):
         return
         
     if not url_input.startswith("http"):
-        bot.send_message(user_id, "❌ URL tidak valid! Pastikan diawali dengan `http://` atau `https://`. Silakan kirim ulang URL-nya:")
+        bot.send_message(user_id, "❌ URL tidak valid! Harus diawali dengan `http://` atau `https://`. Kirim ulang URL-nya:")
         return
         
     data_user = user_states.get(user_id, {})
     title = data_user.get('title')
     
-    # Simpan ke Database
+    # Send loading status ke user
+    status_msg = bot.send_message(user_id, "⏳ Sedang memverifikasi web target, mohon tunggu...")
+    
+    # =========================================================================
+    # 🛡️ PROSES VALIDASI INSTAN (REAL-TIME CHECK)
+    # =========================================================================
+    scraper = cloudscraper.create_scraper()
     try:
+        respon = scraper.get(url_input, timeout=12)
+        
+        if respon.status_code == 403:
+            bot.delete_message(user_id, status_msg.message_id)
+            bot.send_message(user_id, "❌ *Gagal menambahkan!* Website memblokir server Heroku (Eror 403 / Cloudflare). Silakan gunakan link dari web alternatif lain.", parse_mode="Markdown", reply_markup=tombol_utama())
+            user_states.pop(user_id, None)
+            return
+            
+        if respon.status_code != 200:
+            bot.delete_message(user_id, status_msg.message_id)
+            bot.send_message(user_id, f"❌ *Gagal mengakses web!* Server mengembalikan Status Code: {respon.status_code}.", parse_mode="Markdown", reply_markup=tombol_utama())
+            user_states.pop(user_id, None)
+            return
+            
+        # Jika berhasil tembus (Status 200), tes ekstraksi data chapter
+        chapter_terbaru = ekstrak_chapter(respon.text)
+        
+        if not chapter_terbaru:
+            bot.delete_message(user_id, status_msg.message_id)
+            bot.send_message(user_id, "❌ *Gagal mendeteksi data!* Link berhasil dibuka, namun bot tidak menemukan struktur daftar chapter. Pastikan yang kamu kirim adalah link *Halaman Utama* komiknya, bukan halaman sewaktu membaca chapternya.", parse_mode="Markdown", reply_markup=tombol_utama())
+            user_states.pop(user_id, None)
+            return
+            
+        # Lolos semua validasi -> Simpan ke Database bersama Nilai Chapter Asli (Bukan 0 lagi)
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO user_tracks (user_id, title, last_chapter, url)
-            VALUES (%s, %s, '0', %s)
-            ON CONFLICT (user_id, url) DO NOTHING;
-        """, (user_id, title, url_input))
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, url) DO UPDATE SET last_chapter = EXCLUDED.last_chapter;
+        """, (user_id, title, chapter_terbaru, url_input))
         conn.commit()
         cursor.close()
         conn.close()
         
-        bot.send_message(user_id, f"✅ Sukses menambahkan tracker untuk komik: *{title}*!\nBot akan mendeteksi data awal dalam beberapa saat.", parse_mode="Markdown", reply_markup=tombol_utama())
-    except Exception as e:
-        bot.send_message(user_id, f"❌ Terjadi kesalahan saat menyimpan ke database: {e}", reply_markup=tombol_utama())
+        bot.delete_message(user_id, status_msg.message_id)
+        bot.send_message(user_id, f"✅ *Sukses Menambahkan!*\n\n📖 Komik: *{title}*\n✨ Chapter Saat Ini: `{chapter_terbaru}`\n\nBot akan otomatis mengabari kamu jika ada update baru!", parse_mode="Markdown", reply_markup=tombol_utama())
         
-    # Hapus state jika sudah selesai
+    except Exception as e:
+        bot.delete_message(user_id, status_msg.message_id)
+        bot.send_message(user_id, f"❌ Terjadi gangguan jaringan saat memverifikasi link: {e}", reply_markup=tombol_utama())
+        
     user_states.pop(user_id, None)
 
 
@@ -152,11 +198,8 @@ def proses_url_komik(message):
 # =========================================================================
 
 def cek_update_multiuser():
-    """Mengecek seluruh URL unik di DB agar hemat bandwidth server"""
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
-    
-    # Ambil semua URL unik yang didaftarkan oleh siapapun
     cursor.execute("SELECT DISTINCT url FROM user_tracks")
     daftar_url = [r[0] for r in cursor.fetchall()]
     
@@ -171,37 +214,20 @@ def cek_update_multiuser():
         try:
             respon = scraper.get(url, timeout=15)
             if respon.status_code == 200:
-                soup = BeautifulSoup(respon.text, 'html.parser')
-                chapter_terbaru = None
-                
-                # Selektor khusus web Komiku
-                container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter')
-                if container:
-                    first_a = container.find('a')
-                    if first_a:
-                        chapter_terbaru = " ".join(first_a.text.strip().split())
-                
-                if not chapter_terbaru:
-                    chapter_element = soup.find('span', class_='chapnum')
-                    if chapter_element:
-                        chapter_terbaru = " ".join(chapter_element.text.strip().split())
+                chapter_terbaru = ekstrak_chapter(respon.text)
 
                 if chapter_terbaru:
-                    # Ambil semua user yang memantau URL ini
                     cursor.execute("SELECT user_id, title, last_chapter FROM user_tracks WHERE url = %s", (url,))
                     users = cursor.fetchall()
                     
                     for user_id, title, last_chapter in users:
-                        # Jika baru inisialisasi awal (DB masih '0')
                         if last_chapter == '0':
                             cursor.execute(
                                 "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
                                 (chapter_terbaru, user_id, url)
                             )
                             conn.commit()
-                            print(f"[Init] {title} user {user_id} -> {chapter_terbaru}")
                         
-                        # Jika ada rilis chapter baru sungguhan
                         elif chapter_terbaru != last_chapter:
                             pesan = (
                                 f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
@@ -209,26 +235,24 @@ def cek_update_multiuser():
                                 f"✨ Sekarang sudah rilis *{chapter_terbaru}*\n\n"
                                 f"🔗 [Klik untuk Membaca]({url})"
                             )
-                            # Kirim langsung ke user_id yang bersangkutan
                             try:
                                 bot.send_message(user_id, pesan, parse_mode="Markdown")
                             except Exception as e:
-                                print(f"Gagal mengirim notif ke {user_id}: {e}")
+                                print(f"Gagal kirim pesan ke {user_id}: {e}")
                                 
                             cursor.execute(
                                 "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
                                 (chapter_terbaru, user_id, url)
                             )
                             conn.commit()
-                            print(f"[Notif Sent] {title} to user {user_id}")
+                            print(f"[Notif] {title} -> {chapter_terbaru} (User: {user_id})")
         except Exception as e:
-            print(f"Error scraping {url}: {e}")
+            print(f"Error background scraping {url}: {e}")
 
     cursor.close()
     conn.close()
 
 def loop_scraper():
-    """Fungsi loop 15 menit yang akan berjalan di thread terpisah"""
     init_db()
     while True:
         print("--- Memulai Pengecekan Rutin (Multi-User) ---")
@@ -239,18 +263,12 @@ def loop_scraper():
         print("--- Pengecekan Selesai, Istirahat 15 Menit ---")
         time.sleep(900)
 
-# =========================================================================
-# 🚀 MENYALAKAN KEDUA SISTEM SECARA BERSAMAAN
-# =========================================================================
 if __name__ == "__main__":
-    print("Mengaktifkan database...")
     init_db()
     
-    # Jalankan loop scraper di latar belakang (Thread 1)
     thread_Scrap = Thread(target=loop_scraper)
     thread_Scrap.daemon = True
     thread_Scrap.start()
     
-    # Jalankan bot listener untuk dengerin tombol chat di thread utama (Thread 2)
     print("Bot Telegram Interaktif Siap Melayani Pengguna...")
     bot.infinity_polling()
