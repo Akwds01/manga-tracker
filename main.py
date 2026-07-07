@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 import psycopg2
 import cloudscraper
 import telebot
-from threading import Thread  # <--- SUDAH DIAMANKAN KEMBALI
+from threading import Thread
 
 # 1. Konfigurasi Token & Admin dari Heroku Config Vars
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -421,7 +421,7 @@ def tangkap_pesan_broadcast(message):
     bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"✅ *Broadcast Berhasil!* Pesan sukses disiarkan ke `{sukses}` pengguna aktif.", parse_mode="Markdown", reply_markup=markup)
 
 # =========================================================================
-# 🕵️ WORKER SCRAPER LATAR BELAKANG
+# 🕵️ WORKER SCRAPER LATAR BELAKANG (INDENTATION FIXED)
 # =========================================================================
 
 def refresh_loop_multiuser():
@@ -444,4 +444,65 @@ def refresh_loop_multiuser():
                 chapter_web, img_web = ekstrak_data_komik(res.text)
 
                 if chapter_web:
-                    cursor.execute
+                    cursor.execute("SELECT user_id, title, last_chapter FROM user_tracks WHERE url = %s", (url,))
+                    registered_users = cursor.fetchall()
+                    
+                    for user_id, title, last_chapter in registered_users:
+                        if last_chapter == '0':
+                            cursor.execute(
+                                "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
+                                (chapter_web, user_id, url)
+                            )
+                            conn.commit()
+                        
+                        elif chapter_web != last_chapter:
+                            pesan_notif = (
+                                f"🔥 *UPDATE MANGA HYPE RELEASE!* 🔥\n"
+                                f"───────────────────────────\n"
+                                f"📖 Judul: *{title}*\n"
+                                f"✨ Rilis Baru: *{chapter_web}*\n"
+                                f"📥 Status DB: (Lama: `{last_chapter}`)\n"
+                                f"───────────────────────────\n"
+                                f"🚀 Klik tombol di bawah untuk membaca langsung!"
+                            )
+                            
+                            markup = telebot.types.InlineKeyboardMarkup()
+                            markup.add(telebot.types.InlineKeyboardButton(text="🚀 Baca Sekarang", url=url))
+                            
+                            try:
+                                if img_web:
+                                    bot.send_photo(user_id, img_web, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
+                                else:
+                                    bot.send_message(user_id, pesan_notif, parse_mode="Markdown", reply_markup=markup)
+                            except Exception as e:
+                                print(f"Gagal kirim update: {e}")
+                                
+                            cursor.execute(
+                                "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
+                                (chapter_web, user_id, url)
+                            )
+                            conn.commit()
+        except Exception as e:
+            print(f"Error background loop: {e}")
+
+    cursor.close()
+    conn.close()
+
+def loop_background_worker():
+    init_db()
+    while True:
+        try:
+            refresh_loop_multiuser()
+        except Exception as e:
+            print(f"Gagal loop worker: {e}")
+        time.sleep(900)
+
+if __name__ == "__main__":
+    init_db()
+    
+    worker = Thread(target=loop_background_worker)
+    worker.daemon = True
+    worker.start()
+    
+    print("Bot Premium Single Message Dashboard Aktif Sempurna...")
+    bot.infinity_polling()
