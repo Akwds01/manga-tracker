@@ -47,14 +47,14 @@ def init_db():
     # =========================================================================
     target_komik = [
         (
-            'One Piece', 
+            'Became The Patron Of Villains', 
             '0', 
-            'https://bacakomik.co/komik/one-piece-99/'
+            'https://g.shinigami.asia/series/84561956-c987-491d-a189-ba1af3c22810'
         ),
         (
-            'Black Clover', 
+            'Job Change Log', 
             '0', 
-            'https://bacakomik.co/komik/black-clover/'
+            'https://g.shinigami.asia/series/977280a5-eb42-474f-86f3-e63e07e468f6'
         )
     ]
     
