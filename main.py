@@ -40,7 +40,7 @@ def init_db():
     """)
     
     # =========================================================================
-    # DAFTAR KOMIK TARGET (HANYA YANG MAU KAMU TRACK)
+    # DAFTAR KOMIK TARGET (Menggunakan URL Komiku Pilihanmu)
     # =========================================================================
     target_komik = [
         (
@@ -55,12 +55,12 @@ def init_db():
         )
     ]
     
-    # [PENTING] Menghapus komik di database yang tidak terdaftar di list atas lagi
+    # Bersihkan komik lama yang tidak ada di list aktif dari database
     titles = [t[0] for t in target_komik]
     if titles:
         cursor.execute("DELETE FROM manga_tracks WHERE NOT (title = ANY(%s));", (titles,))
     
-    # Masukkan atau update komik yang aktif
+    # Sinkronisasi list komik aktif ke database
     for title, last_chapter, url in target_komik:
         cursor.execute("""
             INSERT INTO manga_tracks (title, last_chapter, url)
@@ -87,12 +87,33 @@ def cek_update():
             
             if respon.status_code == 200:
                 soup = BeautifulSoup(respon.text, 'html.parser')
-                chapter_element = soup.find('span', class_='chapnum')
                 
-                if chapter_element:
-                    chapter_terbaru = chapter_element.text.strip()
+                # --- STRATEGI PENCARIAN CHAPTER KHUSUS KOMIKU ---
+                chapter_terbaru = None
+                
+                # Komiku menggunakan kontainer dengan ID 'Daftar_Chapter'
+                container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter')
+                if container:
+                    # Mencari tag link <a> pertama di dalam daftar chapter (terbaru)
+                    first_a = container.find('a') 
+                    if first_a:
+                        # Mengambil teksnya (Misal: "Chapter 12")
+                        chapter_terbaru = first_a.text.strip()
+                
+                # Jika cara utama gagal, gunakan cadangan pencarian tag span
+                if not chapter_terbaru:
+                    chapter_element = soup.find('span', class_='chapnum')
+                    if chapter_element:
+                        chapter_terbaru = chapter_element.text.strip()
+
+                # --- PROSES VALIDASI DATA & NOTIFIKASI ---
+                if chapter_terbaru:
+                    # Membersihkan teks dari spasi berlebih atau baris baru
+                    chapter_terbaru = " ".join(chapter_terbaru.split())
+                    
                     print(f"[{title}] DB: {last_chapter} | Web: {chapter_terbaru}")
                     
+                    # Jika data awal masih '0', lakukan inisialisasi tanpa kirim notif
                     if last_chapter == '0':
                         cursor.execute(
                             "UPDATE manga_tracks SET last_chapter = %s WHERE title = %s",
@@ -101,6 +122,7 @@ def cek_update():
                         conn.commit()
                         print(f"-> Menginisialisasi chapter awal {title} ke {chapter_terbaru}")
                     
+                    # Jika terdeteksi ada chapter baru sungguhan di web Komiku
                     elif chapter_terbaru != last_chapter:
                         pesan = (
                             f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
