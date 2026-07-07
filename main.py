@@ -77,31 +77,22 @@ def cek_update():
     cursor.execute("SELECT title, last_chapter, url FROM manga_tracks")
     daftar_manga = cursor.fetchall()
 
-    # Header wajib agar Heroku tidak diblokir/403 Forbidden oleh website komik
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    # Bikin objek scraper penembus Cloudflare
+    scraper = cloudscraper.create_scraper()
 
     for title, last_chapter, url in daftar_manga:
         try:
-            # Ambil data HTML dari web komik
-            respon = requests.get(url, headers=headers, timeout=15)
+            # Ambil data HTML menggunakan cloudscraper (otomatis bypass 403)
+            respon = scraper.get(url, timeout=15)
             
             if respon.status_code == 200:
                 soup = BeautifulSoup(respon.text, 'html.parser')
-                
-                # Selektor khusus bertema MangaStream (Bacakomik, Komikcast, Komikindo)
-                # Mengambil tag <span class="chapnum"> yang muncul pertama kali di halaman (terbaru)
                 chapter_element = soup.find('span', class_='chapnum')
                 
                 if chapter_element:
-                    # Hasil pembersihan teks (Contoh: "Chapter 1110" atau "Ch. 370")
                     chapter_terbaru = chapter_element.text.strip()
-                    
-                    # Log internal untuk memantau status di Heroku Logs
                     print(f"[{title}] DB: {last_chapter} | Web: {chapter_terbaru}")
                     
-                    # Jika data di database masih '0', ini adalah running pertama kali (simpan tanpa kirim notif)
                     if last_chapter == '0':
                         cursor.execute(
                             "UPDATE manga_tracks SET last_chapter = %s WHERE title = %s",
@@ -110,20 +101,15 @@ def cek_update():
                         conn.commit()
                         print(f"-> Menginisialisasi chapter awal {title} ke {chapter_terbaru}")
                     
-                    # JIKA ADA CHAPTER BARU NYATA (Tidak sama dengan data di database)
                     elif chapter_terbaru != last_chapter:
-                        # Susun pesan notifikasi estetis dengan format Markdown
                         pesan = (
                             f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
                             f"📖 *{title}*\n"
                             f"✨ Sekarang sudah rilis *{chapter_terbaru}*\n\n"
                             f"🔗 [Klik untuk Membaca]({url})"
                         )
-                        
-                        # Kirim ke Telegram
                         kirim_telegram(pesan)
                         
-                        # Perbarui data chapter terbaru di database
                         cursor.execute(
                             "UPDATE manga_tracks SET last_chapter = %s WHERE title = %s",
                             (chapter_terbaru, title)
