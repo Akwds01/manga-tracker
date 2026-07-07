@@ -60,8 +60,10 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url
 
 def cari_komik_komiku(keyword):
+    """Fungsi pencarian otomatis menggunakan endpoint post_type=manga (FIXED)"""
     scraper = cloudscraper.create_scraper()
-    url = f"https://komiku.org/?s={requests.utils.quote(keyword)}"
+    # Menggunakan format URL yang kamu temukan agar database komik mau merespon
+    url = f"https://komiku.org/?post_type=manga&s={requests.utils.quote(keyword)}"
     results = []
     try:
         respon = scraper.get(url, timeout=10)
@@ -70,14 +72,16 @@ def cari_komik_komiku(keyword):
             
             for a_tag in soup.find_all('a'):
                 href = a_tag.get('href', '')
-                h3 = a_tag.find('h3')
+                h3 = a_tag.find('h3') or a_tag.find('h4')
                 title = h3.text.strip() if h3 else a_tag.text.strip()
                 
                 if "/manga/" in href and title and len(title) > 3:
-                    if any(x in href for x in ["/genre/", "/category/", "/page/", "?s/", "/ch/"]):
+                    # Filter mutlak membuang link halaman navigasi dan genre
+                    if any(x in href for x in ["/genre/", "/category/", "/page/", "/ch/"]):
                         continue
-                    if any(y in title.lower() for y in ["manga", "manhwa", "manhua", "home", "daftar", "next", "prev"]):
+                    if title.lower() in ["manga", "manhwa", "manhua", "home", "daftar komik", "next", "prev", "kembali"]:
                         continue
+                        
                     if href.startswith("/"):
                         href = f"https://komiku.org{href}"
                     if not any(r['url'] == href for r in results):
@@ -421,7 +425,7 @@ def tangkap_pesan_broadcast(message):
     bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"✅ *Broadcast Berhasil!* Pesan sukses disiarkan ke `{sukses}` pengguna aktif.", parse_mode="Markdown", reply_markup=markup)
 
 # =========================================================================
-# 🕵️ WORKER SCRAPER LATAR BELAKANG (INDENTATION FIXED)
+# 🕵️ WORKER SCRAPER LATAR BELAKANG
 # =========================================================================
 
 def refresh_loop_multiuser():
