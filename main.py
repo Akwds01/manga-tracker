@@ -46,12 +46,12 @@ def init_db():
         (
             'Became The Patron Of Villains', 
             '0', 
-            'https://komikcast.bz/komik/became-the-patron-of-villains/'
+            'https://komiku.org/manga/became-the-patron-of-villains/'
         ),
         (
             'Job Change Log', 
             '0', 
-            'https://komikcast.bz/komik/the-job-change-log/'
+            'https://komiku.org/manga/job-change-log/'
         )
     ]
     
