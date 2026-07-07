@@ -60,9 +60,8 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url
 
 def cari_komik_komiku(keyword):
-    """Fungsi pencarian pintar menggunakan parameter sakti dari kamu & Sibling Parser"""
+    """Fungsi pencarian multi-layer menggunakan parameter sakti post_type=manga"""
     scraper = cloudscraper.create_scraper()
-    # Menerapkan parameter post_type=manga temuanmu agar WordPress merespon
     url = f"https://komiku.org/?post_type=manga&s={requests.utils.quote(keyword)}"
     results = []
     status_debug = "SUCCESS"
@@ -74,30 +73,23 @@ def cari_komik_komiku(keyword):
             
         soup = BeautifulSoup(respon.text, 'html.parser')
         
-        # SIBLING PARSER: Ambil semua link yang mengandung unsur manga
         for a_tag in soup.find_all('a'):
             href = a_tag.get('href', '')
             if "/manga/" in href:
-                # Buang link kategori dan halaman navigasi sampah
                 if any(x in href for x in ["/genre/", "/category/", "/page/", "/ch/", "/chapter/", "?s="]): 
                     continue
                 
-                # Ambil teks langsung dari link
                 title = a_tag.text.strip()
                 
-                # JIKA KOSONG (Khas Komiku karena link hanya membungkus gambar cover)
                 if not title:
-                    # Intip container div pembungkusnya, cari tag h2/h3/h4/b di sekitarnya
                     parent = a_tag.find_parent(['div', 'article', 'li', 'td'])
                     if parent:
                         h_tag = parent.find(['h3', 'h4', 'h2', 'b', 'span'])
                         if h_tag:
                             title = h_tag.text.strip()
                 
-                # Bersihkan spasi ganda / enter terikut
                 title = " ".join(title.split())
                 
-                # Filter kata utilitas umum agar tidak lolos jadi judul komik
                 if not title or title.lower() in ["manga", "manhwa", "manhua", "home", "next", "prev", "daftar komik", "kembali", "baca"]:
                     continue
                     
@@ -107,7 +99,7 @@ def cari_komik_komiku(keyword):
                 if not any(r['url'] == href for r in results):
                     results.append({'title': title, 'url': href})
                     
-        if not results:
+        if not Antiquity := results:
             status_debug = "HTML_EMPTY"
             
     except Exception as e:
@@ -184,7 +176,6 @@ def callback_router(call):
         
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="⚡ *Silakan Pilih Metode Penambahan Tracker:*", parse_mode="Markdown", reply_markup=markup)
 
-    # 📋 DAFTAR TRACKER (JUDUL MENJADI HYPERLINK BACA - RE-DESIGNED)
     elif call.data == "btn_daftar":
         bot.answer_callback_query(call.id)
         conn = psycopg2.connect(DATABASE_URL)
@@ -204,7 +195,6 @@ def callback_router(call):
                 f"───────────────────────────\n"
         
         for idx, (db_id, title, last_chapter, url) in enumerate(data, 1):
-            # Judul otomatis dibungkus Markdown Link agar menghemat baris tombol Baca
             pesan += f"{idx}. 📖 [{title}]({url})\n     ✨ Posisi: `{last_chapter}`\n\n"
             
         pesan += f"───────────────────────────\n💡 Klik nama judul untuk membaca. Gunakan menu di bawah untuk mengelola database."
@@ -216,7 +206,6 @@ def callback_router(call):
         )
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
 
-    # 🗑️ SUB-MENU MANAJEMEN HAPUS (COMPACT GRID 5 KOLOM - ANTI SPAM)
     elif call.data == "manage_del":
         bot.answer_callback_query(call.id)
         conn = psycopg2.connect(DATABASE_URL)
@@ -231,15 +220,15 @@ def callback_router(call):
             callback_router(call)
             return
 
-        pesan = "🗑 *MANAJEMEN PENGHAPUSAN TRACKER*\n" \
+        pesan = "🗑️ *MANAJEMEN PENGHAPUSAN TRACKER*\n" \
                 f"───────────────────────────\n"
         for idx, (db_id, title) in enumerate(data, 1):
-            pesan += f" [{idx}]  {title}\n"
+            # FIXED: Menambahkan bintang penutup agar entitas markdown tidak rusak/pecah
+            pesan += f" [{idx}]  *{title}*\n"
         pesan += f"───────────────────────────\n🎯 Silakan klik **Angka Nomor Urut** komik di bawah ini untuk menghapusnya dari radar pemantauan:"
 
         markup = telebot.types.InlineKeyboardMarkup()
         
-        # Generator Grid Tombol Menyamping (Maksimal 5 Angka per baris agar rapi mirip WILA TOPUP)
         row_buttons = []
         for idx, (db_id, title) in enumerate(data, 1):
             row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"exec_del_{db_id}"))
@@ -265,7 +254,6 @@ def callback_router(call):
         nama_del = deleted[0] if deleted else "Komik"
         bot.answer_callback_query(call.id, f"Sukses Menghapus {nama_del}!", show_alert=False)
         
-        # Segar ulang halaman manajemen hapus biar angkanya menyusut otomatis
         call.data = "manage_del"
         callback_router(call)
 
