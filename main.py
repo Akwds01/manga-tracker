@@ -4,10 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 import psycopg2
 import cloudscraper
-import urllib3
-
-# Mematikan notifikasi peringatan SSL Insecure di log Heroku
-urllib3.disable_warnings()
 
 # 1. Konfigurasi Sistem (Diambil dari Heroku Config Vars)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -43,9 +39,7 @@ def init_db():
         )
     """)
     
-    # =========================================================================
-    # DAFTAR KOMIK TARGET (Menggunakan Komikcast yang lebih aman dari Cloudflare)
-    # =========================================================================
+    # DAFTAR KOMIK TARGET (Menggunakan Komikcast)
     target_komik = [
         (
             'Became The Patron Of Villains', 
@@ -61,14 +55,20 @@ def init_db():
             'One Piece',
             '0',
             'https://komikcast.bz/komik/one-piece/'
+        ),
+        (
+            'Black Clover',
+            '0',
+            'https://komikcast.bz/komik/black-clover/'
         )
     ]
     
+    # Menggunakan DO UPDATE SET agar URL lama yang rusak otomatis ditimpa dengan yang baru
     for title, last_chapter, url in target_komik:
         cursor.execute("""
             INSERT INTO manga_tracks (title, last_chapter, url)
             VALUES (%s, %s, %s)
-            ON CONFLICT (title) DO NOTHING;
+            ON CONFLICT (title) DO UPDATE SET url = EXCLUDED.url;
         """, (title, last_chapter, url))
         
     conn.commit()
@@ -82,24 +82,25 @@ def cek_update():
     cursor.execute("SELECT title, last_chapter, url FROM manga_tracks")
     daftar_manga = cursor.fetchall()
 
-    # Bikin objek scraper penembus proteksi
+    # Bikin objek scraper penembus Cloudflare
     scraper = cloudscraper.create_scraper()
 
     for title, last_chapter, url in daftar_manga:
         try:
-            # verify=False digunakan untuk melewati error SSL Certificate
-            respon = scraper.get(url, timeout=15, verify=False)
+            # verify=False Dihapus karena cloudscraper sudah menghandle SSL dengan aman secara native
+            respon = scraper.get(url, timeout=15)
             
             if respon.status_code == 200:
                 soup = BeautifulSoup(respon.text, 'html.parser')
                 
-                # Selektor khusus Komikcast (MangaStream Theme menggunakan tag 'chapnum')
+                # Mengambil tag span class chapnum (Standar Komikcast)
                 chapter_element = soup.find('span', class_='chapnum')
                 
                 if chapter_element:
                     chapter_terbaru = chapter_element.text.strip()
                     print(f"[{title}] DB: {last_chapter} | Web: {chapter_terbaru}")
                     
+                    # Jika baru pertama kali diinput, simpan nomor chapternya tanpa kirim notif
                     if last_chapter == '0':
                         cursor.execute(
                             "UPDATE manga_tracks SET last_chapter = %s WHERE title = %s",
@@ -108,6 +109,7 @@ def cek_update():
                         conn.commit()
                         print(f"-> Menginisialisasi chapter awal {title} ke {chapter_terbaru}")
                     
+                    # Jika mendeteksi ada chapter baru rilis
                     elif chapter_terbaru != last_chapter:
                         pesan = (
                             f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
