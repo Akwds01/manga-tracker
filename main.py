@@ -317,7 +317,14 @@ def callback_router(call):
 # =========================================================================
 # 📥 PROGRAM TANGKAP INPUT USER & PENGHAPUSAN CHAT OTOMATIS
 # =========================================================================
-
+def escape_markdown(text):
+    if not text:
+        return ""
+    # Mengamankan karakter Markdown V1 agar tidak merusak parsing Telegram
+    for char in ['*', '_', '`', '[']:
+        text = text.replace(char, f'\\{char}')
+    return text
+    
 def tangkap_keyword_pencarian(message):
     user_id = message.chat.id
     keyword = message.text.strip()
@@ -329,7 +336,14 @@ def tangkap_keyword_pencarian(message):
     if not msg_dashboard_id:
         return
 
-    bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"⏳ Sedang memproses kata kunci *'{keyword}'* via database post_type=manga...", parse_mode="Markdown", reply_markup=None)
+    # PERBAIKAN: Membungkus post_type=manga dengan backtick (``)
+    bot.edit_message_caption(
+        chat_id=user_id, 
+        message_id=msg_dashboard_id, 
+        caption=f"⏳ Sedang memproses kata kunci *'{keyword}'* via database `post_type=manga`...", 
+        parse_mode="Markdown", 
+        reply_markup=None
+    )
     
     hasil, debug_status = cari_komik_komiku(keyword)
     markup = telebot.types.InlineKeyboardMarkup()
@@ -349,7 +363,6 @@ def tangkap_keyword_pencarian(message):
 
     bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"🎯 *Hasil Pencarian Teratas untuk '{keyword}':*\n\nKlik salah satu tombol judul di bawah untuk langsung mengunci radar pemantauan otomatis:", parse_mode="Markdown", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("save_search_"))
 def simpan_pencarian_otomatis(call):
     user_id = call.message.chat.id
     msg_id = call.message.message_id
