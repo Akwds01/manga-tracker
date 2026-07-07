@@ -4,18 +4,20 @@ import requests
 from bs4 import BeautifulSoup
 import psycopg2
 import cloudscraper
+import urllib3
+
+# Mematikan notifikasi peringatan SSL Insecure di log Heroku
+urllib3.disable_warnings(urllib3.errors.InsecureRequestWarning)
 
 # 1. Konfigurasi Sistem (Diambil dari Heroku Config Vars)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Perbaikan otomatis format URL database bawaan Heroku
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 def kirim_telegram(pesan):
-    """Fungsi untuk mengirim notifikasi teks ke Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
@@ -29,11 +31,9 @@ def kirim_telegram(pesan):
         print(f"Gagal mengirim pesan ke Telegram: {e}")
 
 def init_db():
-    """Fungsi untuk membuat tabel dan memasukkan komik target pertama kali"""
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     
-    # Membuat tabel jika belum ada
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS manga_tracks (
             id SERIAL PRIMARY KEY,
@@ -44,18 +44,23 @@ def init_db():
     """)
     
     # =========================================================================
-    # SILAKAN GANTI TARGET KOMIK DI SINI (Contoh: Jujutsu Kaisen & One Piece)
+    # DAFTAR KOMIK TARGET (Menggunakan Komikcast yang lebih aman dari Cloudflare)
     # =========================================================================
     target_komik = [
         (
             'Became The Patron Of Villains', 
             '0', 
-            'https://g.shinigami.asia/series/84561956-c987-491d-a189-ba1af3c22810'
+            'https://komikcast.bz/komik/became-the-patron-of-villains/'
         ),
         (
             'Job Change Log', 
             '0', 
-            'https://g.shinigami.asia/series/977280a5-eb42-474f-86f3-e63e07e468f6'
+            'https://komikcast.bz/komik/the-job-change-log/'
+        ),
+        (
+            'One Piece',
+            '0',
+            'https://komikcast.bz/komik/one-piece/'
         )
     ]
     
@@ -71,23 +76,24 @@ def init_db():
     conn.close()
 
 def cek_update():
-    """Fungsi inti untuk memantau update chapter komik"""
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     
     cursor.execute("SELECT title, last_chapter, url FROM manga_tracks")
     daftar_manga = cursor.fetchall()
 
-    # Bikin objek scraper penembus Cloudflare
+    # Bikin objek scraper penembus proteksi
     scraper = cloudscraper.create_scraper()
 
     for title, last_chapter, url in daftar_manga:
         try:
-            # Ambil data HTML menggunakan cloudscraper (otomatis bypass 403)
-            respon = scraper.get(url, timeout=15)
+            # verify=False digunakan untuk melewati error SSL Certificate
+            respon = scraper.get(url, timeout=15, verify=False)
             
             if respon.status_code == 200:
                 soup = BeautifulSoup(respon.text, 'html.parser')
+                
+                # Selektor khusus Komikcast (MangaStream Theme menggunakan tag 'chapnum')
                 chapter_element = soup.find('span', class_='chapnum')
                 
                 if chapter_element:
@@ -136,4 +142,4 @@ if __name__ == "__main__":
         print("--- Memulai Pengecekan Rutin ---")
         cek_update()
         print("--- Pengecekan Selesai, Istirahat 15 Menit ---")
-        time.sleep(900)  # Menunggu 900 detik (15 Menit) sebelum looping kembali
+        time.sleep(900)
