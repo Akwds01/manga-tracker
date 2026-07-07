@@ -7,15 +7,18 @@ import cloudscraper
 import telebot
 from threading import Thread
 
-# 1. Konfigurasi Token & DB dari Heroku Config Vars
+# 1. Konfigurasi Token & Admin dari Heroku Config Vars
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+# Menggunakan ID kamu yang sudah tersimpan di Heroku sebagai Hak Akses Admin
+ADMIN_ID = int(os.environ.get("TELEGRAM_CHAT_ID")) if os.environ.get("TELEGRAM_CHAT_ID") else 0
 
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
+search_storage = {}  # Menyimpan sementara hasil pencarian user
 
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
@@ -34,241 +37,457 @@ def init_db():
     cursor.close()
     conn.close()
 
-def ekstrak_chapter(html_text):
-    """Fungsi pembantu untuk mendeteksi chapter dari berbagai jenis struktur web"""
+def ekstrak_data_komik(html_text):
+    """Mengekstrak data chapter dan URL gambar cover (Universal Scraper)"""
     soup = BeautifulSoup(html_text, 'html.parser')
+    chapter_terbaru = None
+    image_url = None
     
-    # Kategori 1: Struktur Web Komiku (id='Daftar_Chapter')
+    # 1. Ambil Gambar Cover via Open Graph Meta Tag (Sangat Akurat)
+    meta_img = soup.find('meta', property='og:image')
+    if meta_img and meta_img.get('content'):
+        image_url = meta_img['content']
+    
+    # Backup cari gambar konvensional jika meta tag tidak ada
+    if not image_url:
+        img_container = soup.find('div', class_='ims') or soup.find(class_='thumb')
+        if img_container and img_container.find('img'):
+            image_url = img_container.find('img').get('src')
+
+    # 2. Ambil Data Chapter (Komiku / MangaStream Theme)
     container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter')
-    if container:
-        first_a = container.find('a')
-        if first_a:
-            return " ".join(first_a.text.strip().split())
+    if container and container.find('a'):
+        chapter_terbaru = " ".join(container.find('a').text.strip().split())
             
-    # Kategori 2: Halaman detail bertema MangaStream/Madara (Komikcast, Bacakomik, Komikindo)
-    container_ms = soup.find(id='chapterlist') or soup.find(class_='cl') or soup.find(class_='clstyle')
-    if container_ms:
-        first_a = container_ms.find('a')
-        if first_a:
-            return " ".join(first_a.text.strip().split())
+    if not chapter_terbaru:
+        container_ms = soup.find(id='chapterlist') or soup.find(class_='cl')
+        if container_ms and container_ms.find('a'):
+            chapter_terbaru = " ".join(container_ms.find('a').text.strip().split())
 
-    # Kategori 3: Pencarian langsung lewat class chapnum (Backup global)
-    chapter_element = soup.find('span', class_='chapnum') or soup.find(class_='chapnum')
-    if chapter_element:
-        return " ".join(chapter_element.text.strip().split())
+    if not chapter_terbaru:
+        ch_el = soup.find('span', class_='chapnum') or soup.find(class_='chapnum')
+        if ch_el:
+            chapter_terbaru = " ".join(ch_el.text.strip().split())
         
-    return None
+    return chapter_terbaru, image_url
+
+def cari_komik_komiku(keyword):
+    """Fungsi pencarian otomatis langsung membelah web Komiku"""
+    scraper = cloudscraper.create_scraper()
+    url = f"https://komiku.org/?s={requests.utils.quote(keyword)}"
+    results = []
+    try:
+        respon = scraper.get(url, timeout=10)
+        if respon.status_code == 200:
+            soup = BeautifulSoup(respon.text, 'html.parser')
+            # Membaca kontainer hasil pencarian standar Komiku
+            for div in soup.find_all('div', class_='bdr'):
+                a_tag = div.find('a')
+                h3_tag = div.find('h3')
+                if a_tag and h3_tag:
+                    title = h3_tag.text.strip()
+                    link = a_tag.get('href')
+                    if "/manga/" in link:
+                        results.append({'title': title, 'url': link})
+            
+            # Jalur cadangan jika struktur pencarian berbeda
+            if not results:
+                for a_tag in soup.find_all('a'):
+                    href = a_tag.get('href', '')
+                    title = a_tag.text.strip()
+                    if "/manga/" in href and title and len(title) > 3 and not any(r['url'] == href for r in results):
+                        results.append({'title': title, 'url': href})
+    except Exception as e:
+        print(f"Gagal melakukan pencarian: {e}")
+    return results[:5]
 
 # =========================================================================
-# 🎛️ USER INTERFACE (TELEGRAM BUTTONS & COMMANDS)
+# 🎛️ NAVIGATION & UI MARKUPS
 # =========================================================================
 
-def tombol_utama():
+def menu_utama(user_id):
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("➕ Tambah Komik", "📋 Daftar Komik")
+    markup.row("➕ Tambah Tracker", "📋 Daftar Tracker Kamu")
+    if user_id == ADMIN_ID:
+        markup.row("⚙️ Menu Panel Admin")
     return markup
 
-@bot.message_handler(commands=['start', 'help'])
-def kirim_welcome(message):
-    nama_user = message.from_user.first_name
-    pesan = (
-        f"Halo *{nama_user}*! 👋\n\n"
-        "Selamat datang di Bot Tracker Komik otomatis.\n"
-        "Bot mendukung link dari *Komiku, Komikcast, Bacakomik, Komikindo*, dll.\n\n"
-        "Silakan gunakan tombol di bawah untuk memulai."
-    )
-    bot.send_message(message.chat.id, pesan, parse_mode="Markdown", reply_markup=tombol_utama())
-
-@bot.message_handler(func=lambda message: message.text == "📋 Daftar Komik")
-def lihat_daftar_komik(message):
-    user_id = message.chat.id
-    
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute("SELECT title, last_chapter, url FROM user_tracks WHERE user_id = %s", (user_id,))
-    daftar = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    
-    if not daftar:
-        bot.send_message(user_id, "❌ Kamu belum menambahkan komik apa pun. Klik *➕ Tambah Komik* untuk memulai!", parse_mode="Markdown")
-        return
-        
-    pesan = "📋 *Daftar Komik Tracker Kamu:*\n\n"
-    for i, (title, last_chapter, url) in enumerate(daftar, 1):
-        pesan += f"{i}. *{title}*\n✨ Posisi: `{last_chapter}`\n🔗 [Link Baca]({url})\n\n"
-        
-    bot.send_message(user_id, pesan, parse_mode="Markdown", disable_web_page_preview=True)
-
-@bot.message_handler(func=lambda message: message.text == "➕ Tambah Komik")
-def mulai_tambah_komik(message):
-    user_id = message.chat.id
-    user_states[user_id] = {'step': 'menunggu_judul'}
-    
+def menu_tambah():
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("❌ Batalkan")
-    
-    bot.send_message(user_id, "Silakan ketik atau kirim *Judul Komik* yang ingin kamu pantau:", parse_mode="Markdown", reply_markup=markup)
+    markup.row("🔍 Cari Otomatis", "🔗 Input URL Manual")
+    markup.row("🔙 Kembali ke Menu Utama")
+    return markup
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('step') == 'menunggu_judul')
-def proses_judul_komik(message):
+def menu_admin():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📊 Statistik Bot", "📢 Broadcast Global")
+    markup.row("🔙 Kembali ke Menu Utama")
+    return markup
+
+# =========================================================================
+# 🤖 HANDLERS CHAT INTERAKTIF
+# =========================================================================
+
+@bot.message_handler(commands=['start', 'help'])
+def command_start(message):
     user_id = message.chat.id
-    teks = message.text.strip()
-    
-    if teks == "❌ Batalkan":
-        user_states.pop(user_id, None)
-        bot.send_message(user_id, "Proses penambahan dibatalkan.", reply_markup=tombol_utama())
-        return
-        
-    user_states[user_id] = {'step': 'menunggu_url', 'title': teks}
-    bot.send_message(user_id, f"Judul diterima: *{teks}*\n\nSekarang, kirim *URL/Link utama komik tersebut* (Contoh: https://komiku.org/manga/judul-komik/):", parse_mode="Markdown")
+    user_states.pop(user_id, None)
+    pesan = (
+        f"✨ *WILA SHORT MANGA TRACKER* ✨\n"
+        f"───────────────────────\n"
+        f"Halo *{message.from_user.first_name}*! 👋\n"
+        f"Bot ini siap memantau update Manga/Manhwa kesukaanmu "
+        f"secara otomatis 24 jam penuh.\n\n"
+        f"💡 *Fitur:* Mendukung sistem pencarian judul langsung atau "
+        f"input URL manual (*Komiku, Komikcast, Bacakomik*, dll).\n"
+        f"───────────────────────\n"
+        f"Silakan pilih menu di bawah ini:"
+    )
+    bot.send_message(user_id, pesan, parse_mode="Markdown", reply_markup=menu_utama(user_id))
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('step') == 'menunggu_url')
-def proses_url_komik(message):
+@bot.message_handler(func=lambda m: m.text == "🔙 Kembali ke Menu Utama")
+def kembali_utama(message):
+    user_id = message.chat.id
+    user_states.pop(user_id, None)
+    bot.send_message(user_id, "🏠 Kembali ke Menu Utama.", reply_markup=menu_utama(user_id))
+
+@bot.message_handler(func=lambda m: m.text == "➕ Tambah Tracker")
+def sub_menu_tambah(message):
+    bot.send_message(message.chat.id, "⚡ *Pilih Metode Penambahan:*", parse_mode="Markdown", reply_markup=menu_tambah())
+
+# 🔗 PROSES PENAMBAHAN MANUAL (URL)
+@bot.message_handler(func=lambda m: m.text == "🔗 Input URL Manual")
+def manual_judul(message):
+    user_id = message.chat.id
+    user_states[user_id] = {'step': 'manual_menunggu_judul'}
+    bot.send_message(user_id, "📝 Ketik *Judul Komik* yang ingin kamu pantau:", parse_mode="Markdown", reply_markup=telebot.types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'manual_menunggu_judul')
+def manual_proses_judul(message):
+    user_id = message.chat.id
+    judul = message.text.strip()
+    user_states[user_id] = {'step': 'manual_menunggu_url', 'title': judul}
+    bot.send_message(user_id, f"📌 Judul: *{judul}*\n\nSekarang kirim *URL/Link utama halaman komiknya*:", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'manual_menunggu_url')
+def manual_proses_url(message):
     user_id = message.chat.id
     url_input = message.text.strip()
-    
-    if url_input == "❌ Batalkan":
-        user_states.pop(user_id, None)
-        bot.send_message(user_id, "Proses penambahan dibatalkan.", reply_markup=tombol_utama())
-        return
-        
+    title = user_states[message.chat.id].get('title')
+    user_states.pop(user_id, None)
+
     if not url_input.startswith("http"):
-        bot.send_message(user_id, "❌ URL tidak valid! Harus diawali dengan `http://` atau `https://`. Kirim ulang URL-nya:")
+        bot.send_message(user_id, "❌ URL salah/tidak valid!", reply_markup=menu_utama(user_id))
         return
-        
-    data_user = user_states.get(user_id, {})
-    title = data_user.get('title')
-    
-    # Send loading status ke user
-    status_msg = bot.send_message(user_id, "⏳ Sedang memverifikasi web target, mohon tunggu...")
-    
-    # =========================================================================
-    # 🛡️ PROSES VALIDASI INSTAN (REAL-TIME CHECK)
-    # =========================================================================
+
+    status_msg = bot.send_message(user_id, "⏳ Memverifikasi tautan web target...")
     scraper = cloudscraper.create_scraper()
     try:
-        respon = scraper.get(url_input, timeout=12)
-        
-        if respon.status_code == 403:
-            bot.delete_message(user_id, status_msg.message_id)
-            bot.send_message(user_id, "❌ *Gagal menambahkan!* Website memblokir server Heroku (Eror 403 / Cloudflare). Silakan gunakan link dari web alternatif lain.", parse_mode="Markdown", reply_markup=tombol_utama())
-            user_states.pop(user_id, None)
+        res = scraper.get(url_input, timeout=12)
+        try: bot.delete_message(user_id, status_msg.message_id)
+        except: pass
+
+        if res.status_code != 200:
+            bot.send_message(user_id, f"❌ Gagal koneksi! Status Code: {res.status_code}", reply_markup=menu_utama(user_id))
             return
-            
-        if respon.status_code != 200:
-            bot.delete_message(user_id, status_msg.message_id)
-            bot.send_message(user_id, f"❌ *Gagal mengakses web!* Server mengembalikan Status Code: {respon.status_code}.", parse_mode="Markdown", reply_markup=tombol_utama())
-            user_states.pop(user_id, None)
+
+        chapter, img = ekstrak_data_komik(res.text)
+        if not chapter:
+            bot.send_message(user_id, "❌ Gagal mendeteksi struktur chapter. Pastikan itu link info komik!", reply_markup=menu_utama(user_id))
             return
-            
-        # Jika berhasil tembus (Status 200), tes ekstraksi data chapter
-        chapter_terbaru = ekstrak_chapter(respon.text)
-        
-        if not chapter_terbaru:
-            bot.delete_message(user_id, status_msg.message_id)
-            bot.send_message(user_id, "❌ *Gagal mendeteksi data!* Link berhasil dibuka, namun bot tidak menemukan struktur daftar chapter. Pastikan yang kamu kirim adalah link *Halaman Utama* komiknya, bukan halaman sewaktu membaca chapternya.", parse_mode="Markdown", reply_markup=tombol_utama())
-            user_states.pop(user_id, None)
-            return
-            
-        # Lolos semua validasi -> Simpan ke Database bersama Nilai Chapter Asli (Bukan 0 lagi)
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO user_tracks (user_id, title, last_chapter, url)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (user_id, url) DO UPDATE SET last_chapter = EXCLUDED.last_chapter;
-        """, (user_id, title, chapter_terbaru, url_input))
+        """, (user_id, title, chapter, url_input))
         conn.commit()
         cursor.close()
         conn.close()
-        
-        bot.delete_message(user_id, status_msg.message_id)
-        bot.send_message(user_id, f"✅ *Sukses Menambahkan!*\n\n📖 Komik: *{title}*\n✨ Chapter Saat Ini: `{chapter_terbaru}`\n\nBot akan otomatis mengabari kamu jika ada update baru!", parse_mode="Markdown", reply_markup=tombol_utama())
-        
+
+        pesan = f"✅ *BERHASIL DITAMBAHKAN!*\n\n📖 Judul: *{title}*\n⚡ Chapter: `{chapter}`"
+        if img:
+            bot.send_photo(user_id, img, caption=pesan, parse_mode="Markdown", reply_markup=menu_utama(user_id))
+        else:
+            bot.send_message(user_id, pesan, parse_mode="Markdown", reply_markup=menu_utama(user_id))
     except Exception as e:
-        bot.delete_message(user_id, status_msg.message_id)
-        bot.send_message(user_id, f"❌ Terjadi gangguan jaringan saat memverifikasi link: {e}", reply_markup=tombol_utama())
-        
+        bot.send_message(user_id, f"❌ Terjadi gangguan: {e}", reply_markup=menu_utama(user_id))
+
+# 🔍 PROSES PENCARIAN OTOMATIS
+@bot.message_handler(func=lambda m: m.text == "🔍 Cari Otomatis")
+def search_start(message):
+    user_id = message.chat.id
+    user_states[user_id] = {'step': 'menunggu_keyword'}
+    bot.send_message(user_id, "🔍 Masukkan *Kata Kunci / Judul* komik yang ingin dicari:", parse_mode="Markdown", reply_markup=telebot.types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'menunggu_keyword')
+def search_execute(message):
+    user_id = message.chat.id
+    keyword = message.text.strip()
     user_states.pop(user_id, None)
 
+    loading = bot.send_message(user_id, "⚡ Sedang mencari di database Komiku...")
+    hasil = cari_komik_komiku(keyword)
+    try: bot.delete_message(user_id, loading.message_id)
+    except: pass
+
+    if not hasil:
+        bot.send_message(user_id, "❌ Komik tidak ditemukan. Sila coba kata kunci lain atau gunakan Input URL Manual.", reply_markup=menu_utama(user_id))
+        return
+
+    search_storage[user_id] = hasil
+    markup = telebot.types.InlineKeyboardMarkup()
+    for idx, item in enumerate(hasil):
+        markup.add(telebot.types.InlineKeyboardButton(text=item['title'], callback_data=f"addsearch_{idx}"))
+    
+    bot.send_message(user_id, "🎯 *Hasil Pencarian Teratas:*\nKlik judul di bawah untuk langsung memantau:", parse_mode="Markdown", reply_markup=markup)
+    bot.send_message(user_id, "💡 Gunakan tombol menu utama di bawah jika ingin membatalkan:", reply_markup=menu_utama(user_id))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('addsearch_'))
+def callback_add_search(call):
+    user_id = call.message.chat.id
+    idx = int(call.data.split('_')[1])
+    
+    if user_id not in search_storage or idx >= len(search_storage[user_id]):
+        bot.answer_callback_query(call.id, "Sesi kedaluwarsa, silakan cari ulang.")
+        return
+
+    target = search_storage[user_id][idx]
+    title = target['title']
+    url_input = target['url']
+
+    bot.answer_callback_query(call.id, f"Memproses {title}...")
+    scraper = cloudscraper.create_scraper()
+    try:
+        res = scraper.get(url_input, timeout=12)
+        chapter, img = ekstrak_data_komik(res.text)
+        
+        if not chapter:
+            bot.send_message(user_id, "❌ Gagal memproses data chapter dari hasil pencarian.")
+            return
+
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_tracks (user_id, title, last_chapter, url)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, url) DO UPDATE SET last_chapter = EXCLUDED.last_chapter;
+        """, (user_id, title, chapter, url_input))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        pesan = f"✅ *SUKSES MENGAKTIFKAN TRACKER!*\n\n📖 Komik: *{title}*\n⚡ Posisi Saat Ini: `{chapter}`"
+        if img:
+            bot.send_photo(user_id, img, caption=pesan, parse_mode="Markdown")
+        else:
+            bot.send_message(user_id, pesan, parse_mode="Markdown")
+            
+    except Exception as e:
+        bot.send_message(user_id, f"❌ Eror saat menyimpan: {e}")
+
+# 📋 DAFTAR TRACKER & FITUR HAPUS (CRUD COMPLETION)
+@bot.message_handler(func=lambda m: m.text == "📋 Daftar Tracker Kamu")
+def list_tracker(message):
+    user_id = message.chat.id
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, last_chapter, url FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
+    data = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if not data:
+        bot.send_message(user_id, "❌ Kamu belum memantau komik apa pun saat ini.", parse_mode="Markdown")
+        return
+
+    bot.send_message(user_id, f"📋 *Daftar Tracker Aktif Kamu ({len(data)} Judul):*\n"
+                              f"───────────────────────", parse_mode="Markdown")
+    
+    for db_id, title, last_chapter, url in data:
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton(text="📖 Baca", url=url),
+            telebot.types.InlineKeyboardButton(text="❌ Hapus", callback_data=f"del_{db_id}")
+        )
+        bot.send_message(user_id, f"🔸 *{title}*\n⚡ Chapter Terakhir: `{last_chapter}`", parse_mode="Markdown", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('del_'))
+def callback_delete_tracker(call):
+    db_id = int(call.data.split('_')[1])
+    user_id = call.message.chat.id
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    # Pastikan data yang dihapus benar milik user yang menekan tombol
+    cursor.execute("DELETE FROM user_tracks WHERE id = %s AND user_id = %s RETURNING title", (db_id, user_id))
+    deleted = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    if deleted:
+        bot.answer_callback_query(call.id, f"Sukses menghapus {deleted[0]}!")
+        bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text=f"🗑️ *{deleted[0]}* telah dihapus dari tracker kamu.", parse_mode="Markdown")
+    else:
+        bot.answer_callback_query(call.id, "Data tidak ditemukan atau sudah terhapus.")
 
 # =========================================================================
-# 🕵️ REFAKTORISASI JALUR SCRAPER LATAR BELAKANG (BACKGROUND THREAD)
+# ⚙️ PANEL KONTROL ADMIN (STATS & BROADCAST)
 # =========================================================================
 
-def cek_update_multiuser():
+@bot.message_handler(func=lambda m: m.text == "⚙️ Menu Panel Admin" and m.chat.id == ADMIN_ID)
+def panel_admin(message):
+    bot.send_message(ADMIN_ID, "🛠️ *Selamat Datang di Panel Owner Bot:*", parse_mode="Markdown", reply_markup=menu_admin())
+
+@bot.message_handler(func=lambda m: m.text == "📊 Statistik Bot" and m.chat.id == ADMIN_ID)
+def stats_bot(message):
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(DISTINCT user_id), COUNT(*) FROM user_tracks")
+    users, total_tracks = cursor.fetchone()
+    
+    cursor.execute("SELECT title, COUNT(*) as c FROM user_tracks GROUP BY title ORDER BY c DESC LIMIT 3")
+    populer = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    txt_populer = ""
+    for i, (t, c) in enumerate(populer, 1):
+        txt_populer += f"   {i}. {t} ({c} User)\n"
+
+    pesan = (
+        f"📊 *STATISTIK BOT REAL-TIME*\n"
+        f"───────────────────────\n"
+        f"👥 Total Pengguna Unik: `{users}` Orang\n"
+        f"📌 Total Judul Di-track: `{total_tracks}` Item\n\n"
+        f"🔥 *Top 3 Komik Terpopuler:*\n{txt_populer}"
+        f"───────────────────────"
+    )
+    bot.send_message(ADMIN_ID, pesan, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "📢 Broadcast Global" and m.chat.id == ADMIN_ID)
+def start_broadcast(message):
+    user_states[ADMIN_ID] = {'step': 'menunggu_broadcast'}
+    bot.send_message(ADMIN_ID, "📢 Ketik *Pesan Massal* yang ingin kamu kirimkan ke seluruh pengguna bot:", parse_mode="Markdown", reply_markup=telebot.types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'menunggu_broadcast' and m.chat.id == ADMIN_ID)
+def execute_broadcast(message):
+    pesan_bc = message.text.strip()
+    user_states.pop(ADMIN_ID, None)
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT user_id FROM user_tracks")
+    users = [r[0] for r in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+
+    bot.send_message(ADMIN_ID, f"⚡ Mengirim pesan ke {len(users)} pengguna...", reply_markup=menu_utama(ADMIN_ID))
+    
+    sukses = 0
+    for u_id in users:
+        try:
+            bot.send_message(u_id, f"📢 *PEMBERITAHUAN DEVELOPER:*\n\n{pesan_bc}", parse_mode="Markdown")
+            sukses += 1
+            time.sleep(0.05) # Menghindari rate limit bot API
+        except:
+            pass
+            
+    bot.send_message(ADMIN_ID, f"✅ Broadcast selesai! Pesan terkirim ke `{sukses}` pengguna.")
+
+
+# =========================================================================
+# 🕵️ JALUR BACKGROUND REFRESH SCRAPER (THREAD LATAR BELAKANG)
+# =========================================================================
+
+def refresh_loop_multiuser():
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT url FROM user_tracks")
-    daftar_url = [r[0] for r in cursor.fetchall()]
+    urls = [r[0] for r in cursor.fetchall()]
     
-    if not daftar_url:
+    if not urls:
         cursor.close()
         conn.close()
         return
 
     scraper = cloudscraper.create_scraper()
 
-    for url in daftar_url:
+    for url in urls:
         try:
-            respon = scraper.get(url, timeout=15)
-            if respon.status_code == 200:
-                chapter_terbaru = ekstrak_chapter(respon.text)
+            res = scraper.get(url, timeout=15)
+            if res.status_code == 200:
+                chapter_web, img_web = ekstrak_data_komik(res.text)
 
-                if chapter_terbaru:
+                if chapter_web:
                     cursor.execute("SELECT user_id, title, last_chapter FROM user_tracks WHERE url = %s", (url,))
-                    users = cursor.fetchall()
+                    registered_users = cursor.fetchall()
                     
-                    for user_id, title, last_chapter in users:
+                    for user_id, title, last_chapter in registered_users:
                         if last_chapter == '0':
                             cursor.execute(
                                 "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
-                                (chapter_terbaru, user_id, url)
+                                (chapter_web, user_id, url)
                             )
                             conn.commit()
                         
-                        elif chapter_terbaru != last_chapter:
-                            pesan = (
-                                f"🔥 *UPDATE MANGA BARU!* 🔥\n\n"
-                                f"📖 *{title}*\n"
-                                f"✨ Sekarang sudah rilis *{chapter_terbaru}*\n\n"
-                                f"🔗 [Klik untuk Membaca]({url})"
+                        elif chapter_web != last_chapter:
+                            # Tampilan Notifikasi Update dengan Rich Media (Gambar Cover + Link)
+                            pesan_notif = (
+                                f"🔥 *UPDATE MANGA HYPE RELEASE!* 🔥\n"
+                                f"───────────────────────\n"
+                                f"📖 Judul: *{title}*\n"
+                                f"✨ Rilis Baru: *{chapter_web}*\n"
+                                f"📥 Status DB: (Lama: `{last_chapter}`)\n"
+                                f"───────────────────────\n"
+                                f"🚀 Klik link di bawah untuk membaca langsung!"
                             )
+                            
+                            markup = telebot.types.InlineKeyboardMarkup()
+                            markup.add(telebot.types.InlineKeyboardButton(text="🚀 Baca Sekarang", url=url))
+                            
                             try:
-                                bot.send_message(user_id, pesan, parse_mode="Markdown")
+                                if img_web:
+                                    bot.send_photo(user_id, img_web, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
+                                else:
+                                    bot.send_message(user_id, pesan_notif, parse_mode="Markdown", reply_markup=markup)
                             except Exception as e:
-                                print(f"Gagal kirim pesan ke {user_id}: {e}")
+                                print(f"Gagal notif user {user_id}: {e}")
                                 
                             cursor.execute(
                                 "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
-                                (chapter_terbaru, user_id, url)
+                                (chapter_web, user_id, url)
                             )
                             conn.commit()
-                            print(f"[Notif] {title} -> {chapter_terbaru} (User: {user_id})")
+                            print(f"[Notif Sukses] {title} -> {chapter_web} untuk User ID {user_id}")
         except Exception as e:
-            print(f"Error background scraping {url}: {e}")
+            print(f"Error background loop pada {url}: {e}")
 
     cursor.close()
     conn.close()
 
-def loop_scraper():
+def loop_background_worker():
     init_db()
     while True:
-        print("--- Memulai Pengecekan Rutin (Multi-User) ---")
+        print("--- Memulai Pengecekan Rutin (Multi-User Master) ---")
         try:
-            cek_update_multiuser()
+            refresh_loop_multiuser()
         except Exception as e:
-            print(f"Error pada loop scraper: {e}")
+            print(f"Gagal loop worker: {e}")
         print("--- Pengecekan Selesai, Istirahat 15 Menit ---")
         time.sleep(900)
 
 if __name__ == "__main__":
     init_db()
     
-    thread_Scrap = Thread(target=loop_scraper)
-    thread_Scrap.daemon = True
-    thread_Scrap.start()
+    # Menjalankan Thread Latar Belakang untuk Scraper Otomatis
+    worker = Thread(target=loop_background_worker)
+    worker.daemon = True
+    worker.start()
     
-    print("Bot Telegram Interaktif Siap Melayani Pengguna...")
+    # Jalankan Listener Utama Chat Telegram
+    print("Bot Ultimate Terpasang Sempurna. Siap Melayani Pengguna Global...")
     bot.infinity_polling()
