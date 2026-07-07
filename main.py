@@ -3,6 +3,7 @@ import time
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
+import cloudscraper
 
 # 1. Konfigurasi Sistem (Diambil dari Heroku Config Vars)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
