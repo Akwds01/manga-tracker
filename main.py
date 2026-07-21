@@ -56,21 +56,46 @@ def init_db():
 # 🛠️ HELPER SAFE EDIT DASHBOARD & SCRAPING
 # =========================================================================
 
-def edit_dashboard(chat_id, message_id, text, reply_markup=None):
-    """Fungsi aman untuk mengedit dashboard tanpa menyebabkan error crash"""
-    try:
-        bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, parse_mode="Markdown", reply_markup=reply_markup)
-    except Exception:
-        try:
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
-        except Exception as e:
-            print(f"Error edit dashboard: {e}")
-
 def bersihkan_markdown(text):
     """Menghapus karakter yang merusak formatting Markdown Telegram"""
     if not text:
         return ""
-    return text.replace('[', '(').replace(']', ')').replace('*', '').replace('_', ' ')
+    for char in ['*', '_', '`', '[', ']', '(', ')']:
+        text = text.replace(char, '')
+    return text
+
+def edit_dashboard(chat_id, message_id, text, reply_markup=None):
+    """Fungsi pintar update dashboard: Menangani limit caption 1024 char & error media"""
+    # 1. Coba edit caption jika teks muat di caption foto (<= 1000 char)
+    if len(text) <= 1000:
+        try:
+            bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, parse_mode="Markdown", reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+
+    # 2. Coba edit sebagai text biasa (jika pesan lama adalah pesan teks)
+    try:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+
+    # 3. Jika gagal (misal teks > 1000 char di foto), Hapus pesan lama & kirim pesan baru!
+    try:
+        if message_id:
+            bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+    try:
+        new_msg = bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+        user_main_message[chat_id] = new_msg.message_id
+    except Exception:
+        # Fallback tanpa markdown jika ada sintaks bermasalah
+        clean_text = text.replace('*', '').replace('_', '').replace('`', '')
+        new_msg = bot.send_message(chat_id, clean_text, reply_markup=reply_markup)
+        user_main_message[chat_id] = new_msg.message_id
 
 def ekstrak_data_komik(html_text):
     soup = BeautifulSoup(html_text, 'html.parser')
@@ -406,11 +431,14 @@ def callback_router(call):
             pesan = f"📋 *Daftar Tracker Aktif Kamu ({len(data)} Judul):*\n───────────────────────────\n"
             for idx, (db_id, title, last_ch, last_rd, url, updated) in enumerate(data, 1):
                 clean_t = bersihkan_markdown(title)
+                clean_last_ch = bersihkan_markdown(last_ch)
+                clean_last_rd = bersihkan_markdown(last_rd)
                 tgl_update = updated.strftime("%d/%m/%Y") if updated else "-"
+                
                 pesan += (
                     f"{idx}. 📖 [{clean_t}]({url})\n"
-                    f"     ✨ Posisi Web: `{bersihkan_markdown(last_ch)}`\n"
-                    f"     📌 Terakhir Dibaca: `{bersihkan_markdown(last_rd)}`\n"
+                    f"     ✨ Posisi Web: `{clean_last_ch}`\n"
+                    f"     📌 Terakhir Dibaca: `{clean_last_rd}`\n"
                     f"     🗓️ Last Scan: `{tgl_update}`\n\n"
                 )
                 
