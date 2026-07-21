@@ -794,7 +794,9 @@ def callback_router(call):
             pesan += f"───────────────────────────\n💡 Pilih nomor komik untuk melihat detail & sinopsis atau aksi lainnya."
             markup = telebot.types.InlineKeyboardMarkup()
             row_buttons = []
-            for idx, (db_id, title) in enumerate(data, 1):
+            
+            # 🔧 FIX DI SINI: Unpack 5 data (db_id, title, last_ch, url, updated)
+            for idx, (db_id, title, last_ch, url, updated) in enumerate(data, 1):
                 row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"sel_detail_manga_{db_id}"))
                 if len(row_buttons) == 5:
                     markup.row(*row_buttons)
