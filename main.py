@@ -1396,13 +1396,25 @@ def refresh_loop_multiuser():
                                 telebot.types.InlineKeyboardButton(text="🚀 Baca di Web", url=web_link),
                                 telebot.types.InlineKeyboardButton(text="📥 Download PDF", callback_data=f"dln_{track_id}")
                             )
-                            try:
-                                if img_web:
-                                    bot.send_photo(user_id, img_web, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
-                                else:
+                            
+                            # 💡 SIKLUS PENGIRIMAN DENGAN FALLBACK
+                            terkirim = False
+                            if img_web:
+                                try:
+                                    # Unduh gambar via cloudscraper (Bypass Hotlink Protection)
+                                    img_resp = scraper.get(img_web, timeout=10)
+                                    if img_resp.status_code == 200:
+                                        bot.send_photo(user_id, img_resp.content, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
+                                        terkirim = True
+                                except Exception as img_err:
+                                    print(f"Gambar gagal dimuat, beralih ke pesan teks: {img_err}")
+                            
+                            # Jika gambar gagal/tidak ada, kirim pesan teks biasa agar notifikasi tetap sampai
+                            if not terkirim:
+                                try:
                                     bot.send_message(user_id, pesan_notif, parse_mode="Markdown", reply_markup=markup)
-                            except Exception as e:
-                                print(f"Gagal kirim update: {e}")
+                                except Exception as msg_err:
+                                    print(f"Gagal kirim pesan notif: {msg_err}")
                                 
                             cursor.execute("UPDATE user_tracks SET last_chapter = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND url = %s", (chapter_web, user_id, url))
                             conn.commit()
