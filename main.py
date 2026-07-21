@@ -27,15 +27,15 @@ BANNER_MENU_URL = "https://images.unsplash.com/photo-1578632767115-351597cf2477?
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Timeout API Telegram diperpanjang untuk handling pengiriman dokumen
 telebot.apihelper.CUSTOM_REQUEST_TIMEOUT = 180
 telebot.apihelper.CONNECT_TIMEOUT = 30
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_main_message = {}
 user_quality_pref = {}
-user_selected_manga = {}     # Temporary session progress
-user_chapter_storage = {}    # Temporary storage daftar chapter komik
+user_selected_manga = {}     # Cache komik terpilih
+user_chapter_storage = {}    # Cache daftar chapter
+next_chapter_cache = {}      # Cache URL next chapter per user
 
 # =========================================================================
 # 🗄️ DATABASE INITIALIZATION & MIGRATION
@@ -63,11 +63,10 @@ def init_db():
     conn.close()
 
 # =========================================================================
-# 🛠️ HELPER DASHBOARD, SCRAPING, & CONVERTER (HEMAT RAM)
+# 🛠️ HELPER SCRAPING, PDF CONVERTER & RANGE PARSER
 # =========================================================================
 
 def bersihkan_markdown(text):
-    """Menghapus karakter yang merusak formatting Markdown Telegram"""
     if not text:
         return ""
     for char in ['*', '_', '`', '[', ']', '(', ')']:
@@ -75,7 +74,6 @@ def bersihkan_markdown(text):
     return text
 
 def edit_dashboard(chat_id, message_id, text, reply_markup=None):
-    """Fungsi pintar update dashboard"""
     if len(text) <= 1000:
         try:
             bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -103,8 +101,38 @@ def edit_dashboard(chat_id, message_id, text, reply_markup=None):
         new_msg = bot.send_message(chat_id, clean_text, reply_markup=reply_markup)
         user_main_message[chat_id] = new_msg.message_id
 
+def parse_range_input(text):
+    """Mengekstrak rentang angka (misal '1-5' atau '1 - 10')"""
+    match = re.search(r'(\d+)\s*[-_to sampai]+\s*(\d+)', text, re.IGNORECASE)
+    if match:
+        start_num = int(match.group(1))
+        end_num = int(match.group(2))
+        if start_num <= end_num:
+            return start_num, end_num
+        return end_num, start_num
+    return None, None
+
+def parse_manga_slug_and_ch(url_chapter):
+    """Mengekstrak slug komik dan nomor chapter dari URL chapter"""
+    url_clean = url_chapter.rstrip('/')
+    parts = url_clean.split('/')
+    ch_slug = parts[-1]
+    
+    match = re.search(r'^(.*?)[-_]chapter[-_](\d+(\.\d+)?)$', ch_slug, re.IGNORECASE)
+    if match:
+        slug = match.group(1)
+        ch_num = float(match.group(2)) if '.' in match.group(2) else int(match.group(2))
+        return slug, ch_num
+    
+    match_num = re.search(r'(\d+(\.\d+)?)', ch_slug)
+    if match_num:
+        ch_num = float(match_num.group(1)) if '.' in match_num.group(1) else int(match_num.group(1))
+        slug = re.sub(r'[-_]chapter[-_]?\d+(\.\d+)?$', '', ch_slug, flags=re.IGNORECASE)
+        return slug, ch_num
+        
+    return None, None
+
 def ekstrak_nomor_chapter_singkat(title):
-    """Mengekstrak nomor chapter untuk label tombol (Contoh: 'Chapter 44' -> 'Ch 44')"""
     match = re.search(r'(chapter|ch|bab)[-_ ]?(\d+(\.\d+)?)', title, re.IGNORECASE)
     if match:
         return f"Ch {match.group(2)}"
@@ -139,7 +167,6 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url, url_chapter_terbaru
 
 def ekstrak_daftar_chapter(url_manga):
-    """Mengambil daftar chapter dari halaman utama komik (Stabil & Anti-Gagal)"""
     scraper = cloudscraper.create_scraper()
     try:
         res = scraper.get(url_manga, timeout=15)
@@ -176,7 +203,7 @@ def ekstrak_daftar_chapter(url_manga):
                 if not any(c['url'] == href for c in chapters):
                     chapters.append({'title': title, 'url': href})
         
-        return chapters[:10]
+        return chapters[:15]
     except Exception as e:
         print(f"Error ekstrak chapter list: {e}")
         return []
@@ -207,7 +234,6 @@ def ekstrak_gambar_chapter(url_chapter):
         return []
 
 def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
-    """Mengunduh gambar ke Disk Temp & Menyusun PDF via img2pdf (Sangat Hemat RAM < 30 MB)"""
     scraper = cloudscraper.create_scraper()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -243,7 +269,6 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
             return None
 
         temp_files.sort()
-
         pdf_bytes = img2pdf.convert(temp_files)
         pdf_buffer = io.BytesIO(pdf_bytes)
         return pdf_buffer
@@ -263,10 +288,8 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
         gc.collect()
 
 def update_last_read_status(user_id, url_chapter):
-    """Mengubah status Terakhir Dibaca berdasarkan pencocokan URL slug yang presisi"""
     try:
         slug_ch = url_chapter.rstrip('/').split('/')[-1]
-        
         match_ch = re.search(r'(chapter|ch|bab)[-_]?(\d+(\.\d+)?)', slug_ch, re.IGNORECASE)
         if match_ch:
             clean_ch = f"Chapter {match_ch.group(2)}"
@@ -275,7 +298,6 @@ def update_last_read_status(user_id, url_chapter):
 
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-
         cursor.execute("SELECT id, url FROM user_tracks WHERE user_id = %s", (user_id,))
         rows = cursor.fetchall()
 
@@ -320,12 +342,27 @@ def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
     clean_name = url_chapter.rstrip('/').split('/')[-1]
     judul_file = f"{clean_name}_{quality}.pdf"
     
+    # Hitung & buat link Next Chapter otomatis
+    slug, current_ch = parse_manga_slug_and_ch(url_chapter)
+    markup_next = telebot.types.InlineKeyboardMarkup()
+    
+    if slug and current_ch is not None:
+        next_num = int(current_ch + 1) if isinstance(current_ch, int) or current_ch.is_integer() else current_ch + 1
+        next_url = f"https://komiku.org/ch/{slug}-chapter-{next_num}/"
+        cache_key = f"{chat_id}_{next_num}"
+        next_chapter_cache[cache_key] = next_url
+        
+        markup_next.row(
+            telebot.types.InlineKeyboardButton(text=f"➡️ Lanjut Chapter {next_num}", callback_data=f"exec_nxt_{cache_key}")
+        )
+
     try:
         bot.send_document(
             chat_id=chat_id,
             document=(judul_file, pdf_file),
             caption=f"✅ *Download PDF Selesai!*\n📖 `{judul_file}`\n⚡ Mode Kualitas: `{quality}`",
             parse_mode="Markdown",
+            reply_markup=markup_next,
             timeout=180
         )
         update_last_read_status(chat_id, url_chapter)
@@ -367,7 +404,7 @@ def markup_utama(user_id):
         telebot.types.InlineKeyboardButton(text="📥 Download Single PDF", callback_data="btn_download")
     )
     markup.row(
-        telebot.types.InlineKeyboardButton(text="📦 Batch Download", callback_data="btn_batch"),
+        telebot.types.InlineKeyboardButton(text="📦 Batch Download (Range)", callback_data="btn_batch"),
         telebot.types.InlineKeyboardButton(text=f"⚙️ Kualitas PDF: [{q_mode}]", callback_data="toggle_quality")
     )
     markup.row(
@@ -417,6 +454,15 @@ def callback_router(call):
             pesan = dapatkan_text_utama(call.from_user.first_name)
             edit_dashboard(user_id, msg_id, pesan, markup_utama(user_id))
 
+        elif call.data.startswith("exec_nxt_"):
+            cache_key = call.data.replace("exec_nxt_", "")
+            url_target = next_chapter_cache.get(cache_key)
+            if url_target:
+                bot.answer_callback_query(call.id, "⚡ Mengunduh Chapter Selanjutnya...", show_alert=False)
+                eksekusi_unduh_pdf(user_id, url_target)
+            else:
+                bot.answer_callback_query(call.id, "❌ Sesi kedaluwarsa, silakan buka via menu.", show_alert=True)
+
         elif call.data == "toggle_quality":
             curr = user_quality_pref.get(user_id, "HD")
             new_q = "SD" if curr == "HD" else "HD"
@@ -442,14 +488,128 @@ def callback_router(call):
         elif call.data == "btn_batch":
             bot.answer_callback_query(call.id)
             markup = telebot.types.InlineKeyboardMarkup()
-            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan", callback_data="go_home"))
+            markup.row(
+                telebot.types.InlineKeyboardButton(text="🎯 Pilih dari Tracker", callback_data="batch_from_tracker"),
+                telebot.types.InlineKeyboardButton(text="🔗 Paste URL Multiple", callback_data="batch_from_urls")
+            )
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Menu Utama", callback_data="go_home"))
+            
             pesan = (
-                "📦 *BATCH DOWNLOAD PDF CHAPTER*\n"
+                "📦 *MANAJEMEN BATCH DOWNLOAD*\n"
                 "───────────────────────────\n"
-                "Silakan kirimkan **beberapa URL Chapter** sekaligus (satu URL per baris / pisah spasi):\n\n"
+                "Pilih metode batch download yang ingin kamu gunakan:\n\n"
+                "• **Pilih dari Tracker:** Pilih komikmu lalu unduh dengan Preset (1-5, 1-10) atau Custom Range.\n"
+                "• **Paste URL Multiple:** Mengunduh beberapa link URL sekaligus."
+            )
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data == "batch_from_tracker":
+            bot.answer_callback_query(call.id)
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
+            data = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            if not data:
+                markup = telebot.types.InlineKeyboardMarkup()
+                markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="btn_batch"))
+                edit_dashboard(user_id, msg_id, "❌ *Tracker kamu masih kosong.* Tambahkan komik terlebih dahulu.", markup)
+                return
+
+            pesan = "📦 *PILIH KOMIK UNTUK BATCH DOWNLOAD:*\n───────────────────────────\n"
+            for idx, (db_id, title) in enumerate(data, 1):
+                pesan += f" [{idx}]  *{bersihkan_markdown(title)}*\n"
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            row_buttons = []
+            for idx, (db_id, title) in enumerate(data, 1):
+                row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"sel_batch_manga_{db_id}"))
+                if len(row_buttons) == 5:
+                    markup.row(*row_buttons)
+                    row_buttons = []
+            if row_buttons:
+                markup.row(*row_buttons)
+
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali", callback_data="btn_batch"))
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data.startswith("sel_batch_manga_"):
+            db_id = int(call.data.split('_')[3])
+            user_selected_manga[user_id] = db_id
+            bot.answer_callback_query(call.id)
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT title FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            manga_title = res[0] if res else "Komik"
+
+            pesan = (
+                f"📦 *BATCH OPTION: {bersihkan_markdown(manga_title)}*\n"
+                f"───────────────────────────\n"
+                f"Pilih **Preset Rentang Chapter** atau gunakan **Input Range Manual**:"
+            )
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(
+                telebot.types.InlineKeyboardButton(text="⚡ Ch 1 - 5 (Awal)", callback_data=f"exec_preset_batch_{db_id}_1_5"),
+                telebot.types.InlineKeyboardButton(text="⚡ Ch 1 - 10 (Awal)", callback_data=f"exec_preset_batch_{db_id}_1_10")
+            )
+            markup.row(
+                telebot.types.InlineKeyboardButton(text="✏️ Input Range Manual (cth: 1-5)", callback_data=f"btn_custom_range_{db_id}")
+            )
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="batch_from_tracker"))
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data.startswith("exec_preset_batch_"):
+            parts = call.data.split('_')
+            db_id = int(parts[3])
+            start_num = int(parts[4])
+            end_num = int(parts[5])
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if res:
+                slug = res[0].rstrip('/').split('/')[-1]
+                bot.answer_callback_query(call.id, f"🚀 Memulai Batch Download Ch {start_num}-{end_num}...", show_alert=False)
+                
+                for ch in range(start_num, end_num + 1):
+                    url_target = f"https://komiku.org/ch/{slug}-chapter-{ch}/"
+                    bot.send_message(user_id, f"📦 *Mengunduh Chapter {ch} dari {end_num}...*", parse_mode="Markdown")
+                    eksekusi_unduh_pdf(user_id, url_target)
+                    time.sleep(1)
+
+        elif call.data.startswith("btn_custom_range_"):
+            db_id = int(call.data.split('_')[3])
+            user_selected_manga[user_id] = db_id
+            bot.answer_callback_query(call.id)
+            
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="batch_from_tracker"))
+            edit_dashboard(user_id, msg_id, "✏️ Kirim **RENTANG CHAPTER** yang ingin kamu unduh (Contoh: `1-5` atau `10-15`):", markup)
+            bot.register_next_step_handler_by_chat_id(user_id, tangkap_custom_range_batch)
+
+        elif call.data == "batch_from_urls":
+            bot.answer_callback_query(call.id)
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="btn_batch"))
+            pesan = (
+                "📦 *PASTE MULTIPLE URL CHAPTER*\n"
+                "───────────────────────────\n"
+                "Kirimkan **beberapa URL Chapter** sekaligus (satu URL per baris / dipisah spasi):\n\n"
                 "*Contoh:*\n"
-                "`https://komiku.org/ch/chapter-100/`\n"
-                "`https://komiku.org/ch/chapter-101/`"
+                "`https://komiku.org/ch/one-piece-chapter-100/`\n"
+                "`https://komiku.org/ch/one-piece-chapter-101/`"
             )
             edit_dashboard(user_id, msg_id, pesan, markup)
             bot.register_next_step_handler_by_chat_id(user_id, tangkap_batch_download)
@@ -490,7 +650,7 @@ def callback_router(call):
             edit_dashboard(user_id, msg_id, "📥 Silakan **upload file `.json`** hasil backup kamu:", markup)
             bot.register_next_step_handler_by_chat_id(user_id, tangkap_file_import)
 
-        elif call.data == "btn_daftar":  # DAFTAR TRACKER
+        elif call.data == "btn_daftar":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -576,7 +736,7 @@ def callback_router(call):
                 except Exception as e:
                     bot.send_message(user_id, f"❌ Error: {e}")
 
-        elif call.data == "btn_bacaan":  # DAFTAR BACAAN
+        elif call.data == "btn_bacaan":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -834,11 +994,48 @@ def callback_router(call):
 
     except Exception as e:
         print(f"Error callback handler: {e}")
-        bot.answer_callback_query(call.id, "Terjadi kesalahan sistem.", show_alert=False)
 
 # =========================================================================
 # 📥 NEXT STEP HANDLERS
 # =========================================================================
+
+def tangkap_custom_range_batch(message):
+    user_id = message.chat.id
+    input_text = message.text.strip()
+    msg_dashboard_id = user_main_message.get(user_id)
+    db_id = user_selected_manga.get(user_id)
+    
+    try: bot.delete_message(user_id, message.message_id)
+    except: pass
+
+    if not db_id:
+        bot.send_message(user_id, "❌ Sesi telah kedaluwarsa.")
+        return
+
+    start_num, end_num = parse_range_input(input_text)
+    if not start_num or not end_num:
+        bot.send_message(user_id, "❌ Format rentang salah. Gunakan format seperti `1-5` atau `10-15`.")
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+    res = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not res:
+        bot.send_message(user_id, "❌ Komik tidak ditemukan.")
+        return
+
+    slug = res[0].rstrip('/').split('/')[-1]
+    bot.send_message(user_id, f"🚀 *Memulai Batch Download Chapter {start_num} sampai {end_num}...*", parse_mode="Markdown")
+
+    for ch in range(start_num, end_num + 1):
+        url_target = f"https://komiku.org/ch/{slug}-chapter-{ch}/"
+        bot.send_message(user_id, f"📦 *Processing Chapter ({ch}/{end_num})...*", parse_mode="Markdown")
+        eksekusi_unduh_pdf(user_id, url_target)
+        time.sleep(1)
 
 def tangkap_input_nomor_chapter(message):
     user_id = message.chat.id
@@ -850,7 +1047,7 @@ def tangkap_input_nomor_chapter(message):
     except: pass
 
     if not db_id:
-        bot.send_message(user_id, "❌ Sesi telah kedaluwarsa, silakan pilih ulang komik.")
+        bot.send_message(user_id, "❌ Sesi telah kedaluwarsa.")
         return
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -866,7 +1063,6 @@ def tangkap_input_nomor_chapter(message):
 
     manga_title, manga_url = res
     slug = manga_url.rstrip('/').split('/')[-1]
-    
     url_target = f"https://komiku.org/ch/{slug}-chapter-{ch_num}/"
     eksekusi_unduh_pdf(user_id, url_target, status_msg_id=msg_dashboard_id)
 
