@@ -99,27 +99,45 @@ def ekstrak_gambar_chapter(url_chapter):
         print(f"Error scraping gambar chapter: {e}")
         return []
 
-def buat_pdf_dari_gambar(image_urls):
-    """Mengunduh gambar-gambar halaman dan menyatukannya menjadi file PDF di RAM"""
+def buat_pdf_dari_gambar(image_urls, referer_url=None):
+    """Mengunduh gambar-gambar halaman dengan Header Referer & konversi aman ke PDF"""
     scraper = cloudscraper.create_scraper()
+    
+    # Headers khusus untuk menembus Anti-Hotlink CDN Komiku
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": referer_url if referer_url else "https://komiku.org/"
+    }
+    
     pil_images = []
     
     for url in image_urls:
         try:
-            resp = scraper.get(url, timeout=10)
+            resp = scraper.get(url, headers=headers, timeout=12)
             if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                img = Image.open(io.BytesIO(resp.content))
+                # Konversi RGBA/PNG ke RGB standar agar aman saat disimpan ke PDF
+                if img.mode in ("RGBA", "P", "LA"):
+                    img = img.convert("RGB")
+                else:
+                    img = img.convert("RGB")
                 pil_images.append(img)
+            else:
+                print(f"Gagal akses gambar ({resp.status_code}): {url}")
         except Exception as e:
             print(f"Gagal unduh halaman {url}: {e}")
             
     if not pil_images:
         return None
 
-    pdf_buffer = io.BytesIO()
-    pil_images[0].save(pdf_buffer, format='PDF', save_all=True, append_images=pil_images[1:])
-    pdf_buffer.seek(0)
-    return pdf_buffer
+    try:
+        pdf_buffer = io.BytesIO()
+        pil_images[0].save(pdf_buffer, format='PDF', save_all=True, append_images=pil_images[1:])
+        pdf_buffer.seek(0)
+        return pdf_buffer
+    except Exception as e:
+        print(f"Error menyusun file PDF: {e}")
+        return None
 
 def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
     """Fungsi pembantu untuk memproses pengunduhan dan pengiriman PDF"""
@@ -153,10 +171,10 @@ def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
     else:
         bot.edit_message_text(f"📥 *Mengunduh {len(image_urls)} halaman & menyusun PDF...*", chat_id=chat_id, message_id=status_msg_id, parse_mode="Markdown")
 
-    # 2. Konversi ke PDF
-    pdf_file = buat_pdf_dari_gambar(image_urls)
+    # 2. Konversi ke PDF (Menggunakan Referer Header)
+    pdf_file = buat_pdf_dari_gambar(image_urls, referer_url=url_chapter)
     if not pdf_file:
-        bot.send_message(chat_id, "❌ Gagal mengonversi gambar halaman menjadi PDF.")
+        bot.send_message(chat_id, "❌ Gagal mengonversi gambar halaman menjadi PDF. Silakan coba link chapter lain.")
         return
 
     # 3. Kirim File PDF
