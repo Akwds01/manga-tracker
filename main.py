@@ -1,6 +1,7 @@
 import os
 import io
 import time
+import json
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
@@ -9,22 +10,25 @@ import telebot
 from threading import Thread
 from PIL import Image
 
-# 1. Konfigurasi Token & Admin dari Environment Variables
+# =========================================================================
+# ⚙️ KONFIGURASI BOT & DATABASE
+# =========================================================================
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_ID = int(os.environ.get("TELEGRAM_CHAT_ID")) if os.environ.get("TELEGRAM_CHAT_ID") else 0
 
-# URL Banner Dashboard Terpusat
 BANNER_MENU_URL = "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=1000&q=80"
 
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-user_main_message = {} # Menyimpan ID pesan banner utama tiap user
+user_main_message = {}
+user_quality_pref = {} # Memory cache kualitas PDF user ('HD' atau 'SD')
 
 # =========================================================================
-# 🗄️ DATABASE & HELPER SCRAPING / PDF CONVERTER
+# 🗄️ DATABASE INITIALIZATION & MIGRATION
 # =========================================================================
 
 def init_db():
@@ -36,16 +40,24 @@ def init_db():
             user_id BIGINT,
             title VARCHAR(255),
             last_chapter VARCHAR(50) DEFAULT '0',
+            last_read VARCHAR(50) DEFAULT 'Belum Dibaca',
             url TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, url)
         )
     """)
+    # Auto-migration untuk kolom baru
+    cursor.execute("ALTER TABLE user_tracks ADD COLUMN IF NOT EXISTS last_read VARCHAR(50) DEFAULT 'Belum Dibaca';")
+    cursor.execute("ALTER TABLE user_tracks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
     conn.commit()
     cursor.close()
     conn.close()
 
+# =========================================================================
+# 🛠️ SCRAPING, CONVERTER & BACKUP HELPERS
+# =========================================================================
+
 def ekstrak_data_komik(html_text):
-    """Mengekstrak chapter terbaru, thumbnail, dan link chapter terbaru dari halaman utama komik"""
     soup = BeautifulSoup(html_text, 'html.parser')
     chapter_terbaru = None
     image_url = None
@@ -74,7 +86,6 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url, url_chapter_terbaru
 
 def ekstrak_gambar_chapter(url_chapter):
-    """Mengambil semua URL gambar halaman dari satu halaman chapter komik"""
     scraper = cloudscraper.create_scraper()
     try:
         res = scraper.get(url_chapter, timeout=15)
@@ -99,31 +110,26 @@ def ekstrak_gambar_chapter(url_chapter):
         print(f"Error scraping gambar chapter: {e}")
         return []
 
-def buat_pdf_dari_gambar(image_urls, referer_url=None):
-    """Mengunduh gambar-gambar halaman dengan Header Referer & konversi aman ke PDF"""
+def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
     scraper = cloudscraper.create_scraper()
-    
-    # Headers khusus untuk menembus Anti-Hotlink CDN Komiku
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": referer_url if referer_url else "https://komiku.org/"
     }
     
     pil_images = []
-    
     for url in image_urls:
         try:
             resp = scraper.get(url, headers=headers, timeout=12)
             if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content))
-                # Konversi RGBA/PNG ke RGB standar agar aman saat disimpan ke PDF
-                if img.mode in ("RGBA", "P", "LA"):
-                    img = img.convert("RGB")
-                else:
-                    img = img.convert("RGB")
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                
+                # Pengaturan Kualitas Gambar (Fitur 3)
+                if quality == "SD":
+                    new_size = (max(1, img.width // 2), max(1, img.height // 2))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    
                 pil_images.append(img)
-            else:
-                print(f"Gagal akses gambar ({resp.status_code}): {url}")
         except Exception as e:
             print(f"Gagal unduh halaman {url}: {e}")
             
@@ -139,56 +145,74 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None):
         print(f"Error menyusun file PDF: {e}")
         return None
 
+def update_last_read_status(user_id, url_chapter):
+    """Memperbarui penanda progress baca di DB (Fitur 2)"""
+    try:
+        clean_ch = url_chapter.rstrip('/').split('/')[-1].replace('-', ' ').title()
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE user_tracks 
+            SET last_read = %s 
+            WHERE user_id = %s AND %s LIKE '%' || LOWER(REPLACE(title, ' ', '-')) || '%';
+        """, (clean_ch, user_id, url_chapter.lower()))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Gagal update last read: {e}")
+
 def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
-    """Fungsi pembantu untuk memproses pengunduhan dan pengiriman PDF"""
+    quality = user_quality_pref.get(chat_id, "HD")
+    
     if status_msg_id:
         bot.edit_message_caption(
             chat_id=chat_id, 
             message_id=status_msg_id, 
-            caption="⏳ *Sedang mengekstrak gambar halaman komik...*", 
+            caption=f"⏳ *Mengekstrak halaman komik...* (Mode: `{quality}`)", 
             parse_mode="Markdown", 
             reply_markup=None
         )
     else:
-        status_msg = bot.send_message(chat_id, "⏳ *Sedang mengekstrak gambar halaman komik...*", parse_mode="Markdown")
+        status_msg = bot.send_message(chat_id, f"⏳ *Mengekstrak halaman komik...* (Mode: `{quality}`)", parse_mode="Markdown")
         status_msg_id = status_msg.message_id
 
-    # 1. Ambil list gambar
     image_urls = ekstrak_gambar_chapter(url_chapter)
     if not image_urls:
         markup = telebot.types.InlineKeyboardMarkup()
         markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
-        bot.send_message(chat_id, "❌ Gagal menemukan gambar di link tersebut. Pastikan tautan adalah halaman baca chapter.", reply_markup=markup)
+        bot.send_message(chat_id, "❌ Gagal menemukan gambar di link tersebut.", reply_markup=markup)
         return
 
     if status_msg_id and chat_id in user_main_message and user_main_message[chat_id] == status_msg_id:
         bot.edit_message_caption(
             chat_id=chat_id, 
             message_id=status_msg_id, 
-            caption=f"📥 *Mengunduh {len(image_urls)} halaman & menyusun PDF...*", 
+            caption=f"📥 *Mengunduh {len(image_urls)} halaman & menyusun PDF (`{quality}`)...*", 
             parse_mode="Markdown"
         )
     else:
-        bot.edit_message_text(f"📥 *Mengunduh {len(image_urls)} halaman & menyusun PDF...*", chat_id=chat_id, message_id=status_msg_id, parse_mode="Markdown")
+        bot.edit_message_text(f"📥 *Mengunduh {len(image_urls)} halaman & menyusun PDF (`{quality}`)...*", chat_id=chat_id, message_id=status_msg_id, parse_mode="Markdown")
 
-    # 2. Konversi ke PDF (Menggunakan Referer Header)
-    pdf_file = buat_pdf_dari_gambar(image_urls, referer_url=url_chapter)
+    pdf_file = buat_pdf_dari_gambar(image_urls, referer_url=url_chapter, quality=quality)
     if not pdf_file:
-        bot.send_message(chat_id, "❌ Gagal mengonversi gambar halaman menjadi PDF. Silakan coba link chapter lain.")
+        bot.send_message(chat_id, "❌ Gagal mengonversi gambar ke PDF.")
         return
 
-    # 3. Kirim File PDF
     clean_name = url_chapter.rstrip('/').split('/')[-1]
-    judul_file = f"{clean_name}.pdf" if clean_name else "komik_chapter.pdf"
+    judul_file = f"{clean_name}_{quality}.pdf"
     
     try:
         bot.send_document(
             chat_id=chat_id,
             document=(judul_file, pdf_file),
-            caption=f"✅ *Download PDF Selesai!*\n📖 `{judul_file}`",
+            caption=f"✅ *Download PDF Selesai!*\n📖 `{judul_file}`\n⚡ Mode Kualitas: `{quality}`",
             parse_mode="Markdown"
         )
-        # Kembalikan tampilan dashboard jika tadi diedit
+        
+        # Update progress baca di database
+        update_last_read_status(chat_id, url_chapter)
+
         if chat_id in user_main_message and user_main_message[chat_id] == status_msg_id:
             pesan = dapatkan_text_utama(bot.get_chat(chat_id).first_name or "User")
             bot.edit_message_caption(chat_id=chat_id, message_id=status_msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup_utama(chat_id))
@@ -198,7 +222,7 @@ def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
         bot.send_message(chat_id, f"❌ Gagal mengirim file PDF: {e}")
 
 # =========================================================================
-# 🎛️ TAMPILAN DASHBOARD INLINE
+# 🎛️ DASHBOARD UI & KEYBOARDS
 # =========================================================================
 
 def dapatkan_text_utama(nama_user):
@@ -206,36 +230,40 @@ def dapatkan_text_utama(nama_user):
         f"👑 *WILA STORE | MANGA TRACKER & DOWNLOADER* 👑\n"
         f"───────────────────────────\n"
         f"Halo *{nama_user}*! 👋\n\n"
-        f"Selamat datang di sistem manajemen tracker & downloader otomatis.\n"
-        f"Bot ini siaga memantau update komik favoritmu 24/7.\n\n"
+        f"Selamat datang di sistem manajemen tracker & downloader otomatis.\n\n"
         f"⚡ *Status Layanan:* `ONLINE (Lancar) ✅`\n"
-        f"📌 *Tracker:* Input URL Manual Komik\n"
-        f"📥 *Download PDF:* Via tombol menu / Notifikasi / Perintah `/dl`\n"
+        f"📌 *Tracker:* Auto Scan & Last Read Marker\n"
+        f"⚙️ *Mode PDF saat ini:* `{user_quality_pref.get(ADMIN_ID, 'HD')}`\n"
         f"───────────────────────────\n"
         f"Silakan gunakan menu interaktif di bawah ini:"
     )
 
 def markup_utama(user_id):
+    q_mode = user_quality_pref.get(user_id, "HD")
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
         telebot.types.InlineKeyboardButton(text="➕ Tambah Tracker", callback_data="btn_tambah"),
         telebot.types.InlineKeyboardButton(text="📋 Daftar Tracker", callback_data="btn_daftar")
     )
     markup.row(
-        telebot.types.InlineKeyboardButton(text="📥 Download PDF Chapter", callback_data="btn_download")
+        telebot.types.InlineKeyboardButton(text="📥 Download Single PDF", callback_data="btn_download"),
+        telebot.types.InlineKeyboardButton(text="📦 Batch Download", callback_data="btn_batch")
+    )
+    markup.row(
+        telebot.types.InlineKeyboardButton(text=f"⚙️ Kualitas PDF: [{q_mode}]", callback_data="toggle_quality"),
+        telebot.types.InlineKeyboardButton(text="💾 Backup / Restore", callback_data="btn_backup_menu")
     )
     if user_id == ADMIN_ID:
         markup.row(telebot.types.InlineKeyboardButton(text="⚙️ Menu Panel Admin", callback_data="btn_admin"))
     return markup
 
 # =========================================================================
-# 🤖 HANDLERS ROUTING UTAMA
+# 🤖 ROUTING HANDLERS
 # =========================================================================
 
 @bot.message_handler(commands=['start', 'help'])
 def command_start(message):
     user_id = message.chat.id
-    
     hapus_reply = telebot.types.ReplyKeyboardRemove()
     msg_info = bot.send_message(user_id, "⚡ Menginisialisasi Dashboard...", reply_markup=hapus_reply)
     bot.delete_message(user_id, msg_info.message_id)
@@ -252,19 +280,10 @@ def command_start(message):
 def handle_download_pdf(message):
     user_id = message.chat.id
     text_args = message.text.split()
-    
     if len(text_args) < 2:
-        bot.send_message(
-            user_id, 
-            "⚠️ *Format Perintah Salah!*\n\n"
-            "Gunakan format:\n`/dl <URL_CHAPTER_KOMIK>`\n\n"
-            "*Contoh:*\n`/dl https://komiku.org/ch/one-piece-chapter-1100/`", 
-            parse_mode="Markdown"
-        )
+        bot.send_message(user_id, "⚠️ *Format Perintah Salah!*\n\nGunakan: `/dl <URL_CHAPTER>`", parse_mode="Markdown")
         return
-
-    url_chapter = text_args[1].strip()
-    eksekusi_unduh_pdf(user_id, url_chapter)
+    eksekusi_unduh_pdf(user_id, text_args[1].strip())
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_router(call):
@@ -277,37 +296,83 @@ def callback_router(call):
         pesan = dapatkan_text_utama(call.from_user.first_name)
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup_utama(user_id))
 
+    elif call.data == "toggle_quality":
+        curr = user_quality_pref.get(user_id, "HD")
+        new_q = "SD" if curr == "HD" else "HD"
+        user_quality_pref[user_id] = new_q
+        bot.answer_callback_query(call.id, f"Kualitas PDF diubah ke {new_q}!")
+        pesan = dapatkan_text_utama(call.from_user.first_name)
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup_utama(user_id))
+
     elif call.data == "btn_tambah":
         bot.answer_callback_query(call.id)
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan & Kembali", callback_data="go_home"))
-        bot.edit_message_caption(
-            chat_id=user_id, 
-            message_id=msg_id, 
-            caption="🔗 Silakan **kirim URL/Link profil utama komik** secara langsung dari web Komiku:", 
-            parse_mode="Markdown", 
-            reply_markup=markup
-        )
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan", callback_data="go_home"))
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="🔗 Kirim **URL Utama Komik** dari Komiku:", parse_mode="Markdown", reply_markup=markup)
         bot.register_next_step_handler_by_chat_id(user_id, tangkap_url_manual)
 
     elif call.data == "btn_download":
         bot.answer_callback_query(call.id)
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan & Kembali", callback_data="go_home"))
-        bot.edit_message_caption(
-            chat_id=user_id, 
-            message_id=msg_id, 
-            caption="📥 Silakan **kirim URL/Link Chapter Komik** yang ingin diunduh jadi PDF:\n\n*Contoh:*\n`https://komiku.org/ch/one-piece-chapter-1100/`", 
-            parse_mode="Markdown", 
-            reply_markup=markup
-        )
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan", callback_data="go_home"))
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="📥 Kirim **URL Chapter Komik** yang ingin diunduh:", parse_mode="Markdown", reply_markup=markup)
         bot.register_next_step_handler_by_chat_id(user_id, tangkap_url_download_menu)
 
-    elif call.data.startswith("dln_"):
-        # Download PDF langsung dari Tombol Notifikasi
-        db_id = int(call.data.split('_')[1])
-        bot.answer_callback_query(call.id, "⚡ Memulai pengunduhan PDF chapter terbaru...", show_alert=False)
+    elif call.data == "btn_batch": # Fitur 1: Batch Download
+        bot.answer_callback_query(call.id)
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan", callback_data="go_home"))
+        pesan = (
+            "📦 *BATCH DOWNLOAD PDF CHAPTER*\n"
+            "───────────────────────────\n"
+            "Silakan kirimkan **beberapa URL Chapter** sekaligus (satu URL per baris ATAU dipisah spasi):\n\n"
+            "*Contoh:*\n"
+            "`https://komiku.org/ch/chapter-100/`\n"
+            "`https://komiku.org/ch/chapter-101/`\n"
+            "`https://komiku.org/ch/chapter-102/`"
+        )
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
+        bot.register_next_step_handler_by_chat_id(user_id, tangkap_batch_download)
+
+    elif call.data == "btn_backup_menu": # Fitur 4: Backup / Restore
+        bot.answer_callback_query(call.id)
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton(text="📤 Export Backup (JSON)", callback_data="exec_export_backup"),
+            telebot.types.InlineKeyboardButton(text="📥 Import Backup (JSON)", callback_data="exec_import_backup")
+        )
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Menu Utama", callback_data="go_home"))
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="💾 *MANAJEMEN BACKUP & RESTORE DATABASE TRACKER*", parse_mode="Markdown", reply_markup=markup)
+
+    elif call.data == "exec_export_backup":
+        bot.answer_callback_query(call.id, "Mengeksport data...")
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        cursor.execute("SELECT title, url, last_chapter, last_read FROM user_tracks WHERE user_id = %s", (user_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        data_export = [{"title": r[0], "url": r[1], "last_chapter": r[2], "last_read": r[3]} for r in rows]
+        json_bytes = io.BytesIO(json.dumps(data_export, indent=2).encode('utf-8'))
         
+        bot.send_document(
+            chat_id=user_id,
+            document=("wila_manga_backup.json", json_bytes),
+            caption=f"✅ *Export Berhasil!* Menyimpan `{len(data_export)}` daftar komik.",
+            parse_mode="Markdown"
+        )
+
+    elif call.data == "exec_import_backup":
+        bot.answer_callback_query(call.id)
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="btn_backup_menu"))
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="📥 Silakan **upload/kirimkan file `.json`** hasil backup kamu ke chat ini:", parse_mode="Markdown", reply_markup=markup)
+        bot.register_next_step_handler_by_chat_id(user_id, tangkap_file_import)
+
+    elif call.data.startswith("dln_"):
+        db_id = int(call.data.split('_')[1])
+        bot.answer_callback_query(call.id, "⚡ Memulai pengunduhan PDF...", show_alert=False)
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         cursor.execute("SELECT url FROM user_tracks WHERE id = %s", (db_id,))
@@ -326,34 +391,37 @@ def callback_router(call):
                 else:
                     bot.send_message(user_id, "❌ Gagal mendapatkan link chapter terbaru.")
             except Exception as e:
-                bot.send_message(user_id, f"❌ Error saat memuat data: {e}")
+                bot.send_message(user_id, f"❌ Error: {e}")
 
-    elif call.data == "btn_daftar":
+    elif call.data == "btn_daftar": # Fitur 2 & 5: Marker & Jadwal Info
         bot.answer_callback_query(call.id)
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, title, last_chapter, url FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
+        cursor.execute("SELECT id, title, last_chapter, last_read, url, updated_at FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
         data = cursor.fetchall()
         cursor.close()
         conn.close()
 
         if not data:
             markup = telebot.types.InlineKeyboardMarkup()
-            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Menu Utama", callback_data="go_home"))
-            bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="❌ *Kamu belum memantau komik apa pun saat ini.*", parse_mode="Markdown", reply_markup=markup)
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Menu Utama", callback_data="go_home"))
+            bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="❌ *Kamu belum memantau komik apa pun.*", parse_mode="Markdown", reply_markup=markup)
             return
 
-        pesan = f"📋 *Daftar Tracker Aktif Kamu ({len(data)} Judul):*\n" \
-                f"───────────────────────────\n"
-        
-        for idx, (db_id, title, last_chapter, url) in enumerate(data, 1):
-            pesan += f"{idx}. 📖 [{title}]({url})\n     ✨ Posisi: `{last_chapter}`\n\n"
+        pesan = f"📋 *Daftar Tracker Aktif Kamu ({len(data)} Judul):*\n───────────────────────────\n"
+        for idx, (db_id, title, last_ch, last_rd, url, updated) in enumerate(data, 1):
+            tgl_update = updated.strftime("%d/%m/%Y") if updated else "-"
+            pesan += (
+                f"{idx}. 📖 [{title}]({url})\n"
+                f"     ✨ Posisi Web: `{last_ch}`\n"
+                f"     📌 Terakhir Dibaca: `{last_rd}`\n"
+                f"     🗓️ Last Scan: `{tgl_update}`\n\n"
+            )
             
-        pesan += f"───────────────────────────\n💡 Klik nama judul untuk membaca. Gunakan menu di bawah untuk mengelola database."
-        
+        pesan += f"───────────────────────────\n💡 Klik nama judul untuk membaca langsung di web."
         markup = telebot.types.InlineKeyboardMarkup()
         markup.row(
-            telebot.types.InlineKeyboardButton(text="🗑️ Manajemen Hapus", callback_data="manage_del"),
+            telebot.types.InlineKeyboardButton(text="🗑️ Hapus Tracker", callback_data="manage_del"),
             telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home")
         )
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
@@ -372,14 +440,11 @@ def callback_router(call):
             callback_router(call)
             return
 
-        pesan = "🗑️ *MANAJEMEN PENGHAPUSAN TRACKER*\n" \
-                f"───────────────────────────\n"
+        pesan = "🗑️ *PILIH NOMOR UNTUK MENGHAPUS TRACKER:*\n───────────────────────────\n"
         for idx, (db_id, title) in enumerate(data, 1):
             pesan += f" [{idx}]  *{title}*\n"
-        pesan += f"───────────────────────────\n🎯 Silakan klik **Angka Nomor Urut** komik di bawah ini untuk menghapusnya dari pemantauan:"
 
         markup = telebot.types.InlineKeyboardMarkup()
-        
         row_buttons = []
         for idx, (db_id, title) in enumerate(data, 1):
             row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"exec_del_{db_id}"))
@@ -389,7 +454,7 @@ def callback_router(call):
         if row_buttons:
             markup.row(*row_buttons)
 
-        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Daftar", callback_data="btn_daftar"))
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali", callback_data="btn_daftar"))
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
 
     elif call.data.startswith("exec_del_"):
@@ -402,9 +467,7 @@ def callback_router(call):
         cursor.close()
         conn.close()
         
-        nama_del = deleted[0] if deleted else "Komik"
-        bot.answer_callback_query(call.id, f"Sukses Menghapus {nama_del}!", show_alert=False)
-        
+        bot.answer_callback_query(call.id, f"Sukses Menghapus {deleted[0] if deleted else 'Komik'}!", show_alert=False)
         call.data = "manage_del"
         callback_router(call)
 
@@ -416,7 +479,7 @@ def callback_router(call):
             telebot.types.InlineKeyboardButton(text="📢 Broadcast Global", callback_data="admin_bc")
         )
         markup.row(telebot.types.InlineKeyboardButton(text="🔙 Menu Utama", callback_data="go_home"))
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="🛠️ *Selamat Datang di Panel Owner Bot WILA STORE:*", parse_mode="Markdown", reply_markup=markup)
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="🛠️ *Panel Owner WILA STORE:*", parse_mode="Markdown", reply_markup=markup)
 
     elif call.data == "admin_stats" and user_id == ADMIN_ID:
         bot.answer_callback_query(call.id)
@@ -424,50 +487,80 @@ def callback_router(call):
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(DISTINCT user_id), COUNT(*) FROM user_tracks")
         users, total_tracks = cursor.fetchone()
-        cursor.execute("SELECT title, COUNT(*) as c FROM user_tracks GROUP BY title ORDER BY c DESC LIMIT 3")
-        populer = cursor.fetchall()
         cursor.close()
         conn.close()
 
-        txt_populer = ""
-        for i, (t, c) in enumerate(populer, 1):
-            txt_populer += f"   {i}. {t} ({c} User)\n"
-
-        pesan = (
-            f"📊 *STATISTIK BOT REAL-TIME*\n"
-            f"───────────────────────────\n"
-            f"👥 Total Pengguna Unik: `{users}` Orang\n"
-            f"📌 Total Judul Di-track: `{total_tracks}` Item\n\n"
-            f"🔥 *Top 3 Komik Terpopuler:*\n{txt_populer}"
-            f"───────────────────────────"
-        )
+        pesan = f"📊 *STATISTIK BOT REAL-TIME*\n───────────────────────────\n👥 User Unik: `{users}` Orang\n📌 Total Tracker: `{total_tracks}` Item"
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Panel", callback_data="btn_admin"))
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Panel Admin", callback_data="btn_admin"))
         bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
 
     elif call.data == "admin_bc" and user_id == ADMIN_ID:
         bot.answer_callback_query(call.id)
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batalkan", callback_data="btn_admin"))
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="📢 Silakan **ketik dan kirim pesan massal** yang ingin disiarkan ke seluruh user:", parse_mode="Markdown", reply_markup=markup)
+        markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="btn_admin"))
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_id, caption="📢 Kirim pesan broadcast massal:", parse_mode="Markdown", reply_markup=markup)
         bot.register_next_step_handler_by_chat_id(user_id, tangkap_pesan_broadcast)
 
 # =========================================================================
-# 📥 PROGRAM TANGKAP INPUT USER
+# 📥 NEXT STEP HANDLERS
 # =========================================================================
+
+def tangkap_batch_download(message):
+    user_id = message.chat.id
+    raw_text = message.text.strip()
+    try: bot.delete_message(user_id, message.message_id)
+    except: pass
+
+    urls = [u.strip() for u in raw_text.replace('\n', ' ').split() if u.strip().startswith("http")]
+    if not urls:
+        bot.send_message(user_id, "❌ Tidak ditemukan URL valid. Pastikan diawali `http://` atau `https://`.")
+        return
+
+    bot.send_message(user_id, f"🚀 *Memproses Batch Download untuk {len(urls)} Chapter...*", parse_mode="Markdown")
+    for idx, url in enumerate(urls, 1):
+        bot.send_message(user_id, f"📦 *Processing Chapter ({idx}/{len(urls)})...*", parse_mode="Markdown")
+        eksekusi_unduh_pdf(user_id, url)
+        time.sleep(1)
+
+def tangkap_file_import(message):
+    user_id = message.chat.id
+    if not message.document or not message.document.file_name.endswith('.json'):
+        bot.send_message(user_id, "❌ Harap kirimkan file berformat `.json`!")
+        return
+
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        items = json.loads(downloaded.decode('utf-8'))
+
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        inserted = 0
+        for item in items:
+            cursor.execute("""
+                INSERT INTO user_tracks (user_id, title, last_chapter, last_read, url)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, url) DO NOTHING;
+            """, (user_id, item['title'], item.get('last_chapter', '0'), item.get('last_read', 'Belum Dibaca'), item['url']))
+            inserted += cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        bot.send_message(user_id, f"✅ *Import Selesai!* Berhasil menambahkan `{inserted}` komik baru ke database tracker kamu.", parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(user_id, f"❌ Gagal memproses file import: {e}")
 
 def tangkap_url_download_menu(message):
     user_id = message.chat.id
     url_input = message.text.strip()
     msg_dashboard_id = user_main_message.get(user_id)
-
     try: bot.delete_message(user_id, message.message_id)
     except: pass
 
     if not url_input.startswith("http"):
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔄 Input Ulang URL", callback_data="btn_download"))
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption="❌ *Format link salah!* URL harus diawali dengan http:// atau https://", parse_mode="Markdown", reply_markup=markup)
+        bot.send_message(user_id, "❌ Format link salah!")
         return
 
     eksekusi_unduh_pdf(user_id, url_input, status_msg_id=msg_dashboard_id)
@@ -476,36 +569,26 @@ def tangkap_url_manual(message):
     user_id = message.chat.id
     url_input = message.text.strip()
     msg_dashboard_id = user_main_message.get(user_id)
-
     try: bot.delete_message(user_id, message.message_id)
     except: pass
 
     if not url_input.startswith("http"):
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="🔄 Input Ulang URL", callback_data="btn_tambah"))
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption="❌ *Format link salah!* URL harus diawali dengan http:// atau https://", parse_mode="Markdown", reply_markup=markup)
+        bot.send_message(user_id, "❌ Format link salah!")
         return
 
-    bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption="⏳ Sedang memverifikasi link komik...", parse_mode="Markdown", reply_markup=None)
-    
     scraper = cloudscraper.create_scraper()
     try:
         res = scraper.get(url_input, timeout=12)
         if res.status_code != 200:
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.row(telebot.types.InlineKeyboardButton(text="🔄 Coba Lagi", callback_data="btn_tambah"))
-            bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"❌ Gagal koneksi! Server status: {res.status_code}", parse_mode="Markdown", reply_markup=markup)
+            bot.send_message(user_id, "❌ Gagal koneksi ke web komik.")
             return
 
         chapter, img, _ = ekstrak_data_komik(res.text)
         if not chapter:
-            markup = telebot.types.InlineKeyboardMarkup()
-            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali", callback_data="go_home"))
-            bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption="❌ Gagal mengekstrak chapter. Pastikan itu adalah Link Profil Utama komik.", parse_mode="Markdown", reply_markup=markup)
+            bot.send_message(user_id, "❌ Gagal mengekstrak chapter komik.")
             return
 
         title_slug = url_input.split('/manga/')[-1].replace('/', '').replace('-', ' ').title()
-
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         cursor.execute("""
@@ -518,19 +601,15 @@ def tangkap_url_manual(message):
         conn.close()
 
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.row(telebot.types.InlineKeyboardButton(text="📋 Tampilkan Daftar Tracker", callback_data="btn_daftar"))
+        markup.row(telebot.types.InlineKeyboardButton(text="📋 Lihat Daftar", callback_data="btn_daftar"))
         markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
-
-        pesan = f"✅ *PROSES INPUT MANUAL SUKSES!*\n\n📖 Komik: *{title_slug}*\n⚡ Posisi: `{chapter}`"
-        bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=pesan, parse_mode="Markdown", reply_markup=markup)
+        bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"✅ *TRACKER AKTIF!*\n\n📖 Komik: *{title_slug}*\n⚡ Posisi: `{chapter}`", parse_mode="Markdown", reply_markup=markup)
     except Exception as e:
-        print(f"Error koneksi manual: {e}")
+        print(f"Error manual: {e}")
 
 def tangkap_pesan_broadcast(message):
     user_id = message.chat.id
     pesan_bc = message.text.strip()
-    msg_dashboard_id = user_main_message.get(user_id)
-
     try: bot.delete_message(user_id, message.message_id)
     except: pass
 
@@ -544,18 +623,16 @@ def tangkap_pesan_broadcast(message):
     sukses = 0
     for u_id in users:
         try:
-            bot.send_message(u_id, f"📢 *PEMBERITAHUAN DEVELOPER WILA STORE:*\n\n{pesan_bc}", parse_mode="Markdown")
+            bot.send_message(u_id, f"📢 *PEMBERITAHUAN WILA STORE:*\n\n{pesan_bc}", parse_mode="Markdown")
             sukses += 1
             time.sleep(0.05)
         except:
             pass
-            
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
-    bot.edit_message_caption(chat_id=user_id, message_id=msg_dashboard_id, caption=f"✅ *Broadcast Berhasil!* Pesan sukses disiarkan ke `{sukses}` pengguna.", parse_mode="Markdown", reply_markup=markup)
+
+    bot.send_message(user_id, f"✅ Broadcast dikirim ke `{sukses}` user.", parse_mode="Markdown")
 
 # =========================================================================
-# 🕵️ WORKER SCRAPER LATAR BELAKANG
+# 🕵️ WORKER BACKGROUND SCRAPER
 # =========================================================================
 
 def refresh_loop_multiuser():
@@ -570,7 +647,6 @@ def refresh_loop_multiuser():
         return
 
     scraper = cloudscraper.create_scraper()
-
     for url in urls:
         try:
             res = scraper.get(url, timeout=15)
@@ -583,12 +659,8 @@ def refresh_loop_multiuser():
                     
                     for track_id, user_id, title, last_chapter in registered_users:
                         if last_chapter == '0':
-                            cursor.execute(
-                                "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
-                                (chapter_web, user_id, url)
-                            )
+                            cursor.execute("UPDATE user_tracks SET last_chapter = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND url = %s", (chapter_web, user_id, url))
                             conn.commit()
-                        
                         elif chapter_web != last_chapter:
                             pesan_notif = (
                                 f"🔥 *UPDATE MANGA HYPE RELEASE!* 🔥\n"
@@ -596,17 +668,14 @@ def refresh_loop_multiuser():
                                 f"📖 Judul: *{title}*\n"
                                 f"✨ Rilis Baru: *{chapter_web}*\n"
                                 f"📥 Status DB: (Lama: `{last_chapter}`)\n"
-                                f"───────────────────────────\n"
-                                f"🚀 Silakan pilih opsi di bawah ini:"
+                                f"───────────────────────────"
                             )
-                            
                             markup = telebot.types.InlineKeyboardMarkup()
                             web_link = url_chapter_terbaru if url_chapter_terbaru else url
                             markup.row(
                                 telebot.types.InlineKeyboardButton(text="🚀 Baca di Web", url=web_link),
                                 telebot.types.InlineKeyboardButton(text="📥 Download PDF", callback_data=f"dln_{track_id}")
                             )
-                            
                             try:
                                 if img_web:
                                     bot.send_photo(user_id, img_web, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
@@ -615,10 +684,7 @@ def refresh_loop_multiuser():
                             except Exception as e:
                                 print(f"Gagal kirim update: {e}")
                                 
-                            cursor.execute(
-                                "UPDATE user_tracks SET last_chapter = %s WHERE user_id = %s AND url = %s",
-                                (chapter_web, user_id, url)
-                            )
+                            cursor.execute("UPDATE user_tracks SET last_chapter = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND url = %s", (chapter_web, user_id, url))
                             conn.commit()
         except Exception as e:
             print(f"Error background loop: {e}")
@@ -646,5 +712,5 @@ if __name__ == "__main__":
     worker.daemon = True
     worker.start()
     
-    print("Bot Premium Single Message Dashboard Aktif Sempurna...")
+    print("Bot Premium WILA STORE All-In-One Features Aktif...")
     bot.infinity_polling()
