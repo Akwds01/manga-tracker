@@ -3,3 +3,4 @@ cloudscraper
 beautifulsoup4
 psycopg2-binary
 Pillow
+img2pdf
