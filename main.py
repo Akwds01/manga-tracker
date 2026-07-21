@@ -863,6 +863,32 @@ def callback_router(call):
             )
             edit_dashboard(user_id, msg_id, pesan, markup)
 
+
+        elif call.data.startswith("exec_dl_lat_"):
+            db_id = int(call.data.split('_')[3])
+            bot.answer_callback_query(call.id, "⚡ Mengekstrak & Mengunduh Chapter Terbaru...", show_alert=False)
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if res:
+                manga_url = res[0]
+                scraper = cloudscraper.create_scraper()
+                try:
+                    r = scraper.get(manga_url, timeout=12)
+                    if r.status_code == 200:
+                        _, _, url_latest = ekstrak_data_komik(r.text)
+                        if url_latest:
+                            eksekusi_unduh_pdf(user_id, url_latest, is_batch=False)
+                        else:
+                            bot.send_message(user_id, "❌ Gagal menemukan URL chapter terbaru.")
+                except Exception as e:
+                    bot.send_message(user_id, f"❌ Error download chapter terbaru: {e}")
+
         elif call.data == "btn_bacaan":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
@@ -1382,39 +1408,45 @@ def refresh_loop_multiuser():
                             cursor.execute("UPDATE user_tracks SET last_chapter = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND url = %s", (chapter_web, user_id, url))
                             conn.commit()
                         elif chapter_web != last_chapter:
+                            # 🎨 TAMPILAN NOTIFIKASI ELEGAN & DYNAMIC
                             pesan_notif = (
-                                f"🔥 *UPDATE MANGA HYPE RELEASE!* 🔥\n"
-                                f"───────────────────────────\n"
-                                f"📖 Judul: *{bersihkan_markdown(title)}*\n"
-                                f"✨ Rilis Baru: *{bersihkan_markdown(chapter_web)}*\n"
-                                f"📥 Status DB: (Lama: `{bersihkan_markdown(last_chapter)}`)\n"
-                                f"───────────────────────────"
-                            )
-                            markup = telebot.types.InlineKeyboardMarkup()
-                            web_link = url_chapter_terbaru if url_chapter_terbaru else url
-                            markup.row(
-                                telebot.types.InlineKeyboardButton(text="🚀 Baca di Web", url=web_link),
-                                telebot.types.InlineKeyboardButton(text="📥 Download PDF", callback_data=f"dln_{track_id}")
+                                f"🎉 *NOTIFIKASI CHAPTER BARU!* 🎉\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📖 *Komik:* *{bersihkan_markdown(title)}*\n\n"
+                                f"⚡ *Chapter Terbaru:* `{bersihkan_markdown(chapter_web)}`\n"
+                                f"📌 *Progress DB:* `{bersihkan_markdown(last_chapter)}`\n"
+                                f"🏷️ *Status Web:* `ONLINE & READY`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"👇 *Pilih aksi cepat di bawah ini:*"
                             )
                             
-                            # 💡 SIKLUS PENGIRIMAN DENGAN FALLBACK
+                            markup = telebot.types.InlineKeyboardMarkup()
+                            web_link = url_chapter_terbaru if url_chapter_terbaru else url
+                            
+                            markup.row(
+                                telebot.types.InlineKeyboardButton(text="🌐 Baca di Web", url=web_link),
+                                telebot.types.InlineKeyboardButton(text="📥 Download PDF", callback_data=f"exec_dl_lat_{track_id}")
+                            )
+                            markup.row(
+                                telebot.types.InlineKeyboardButton(text="ℹ️ Detail & Sinopsis", callback_data=f"sel_detail_manga_{track_id}")
+                            )
+                            
+                            # 💡 PENGIRIMAN DENGAN HYBRID FALLBACK (Foto / Teks)
                             terkirim = False
                             if img_web:
                                 try:
-                                    # Unduh gambar via cloudscraper (Bypass Hotlink Protection)
                                     img_resp = scraper.get(img_web, timeout=10)
                                     if img_resp.status_code == 200:
                                         bot.send_photo(user_id, img_resp.content, caption=pesan_notif, parse_mode="Markdown", reply_markup=markup)
                                         terkirim = True
                                 except Exception as img_err:
-                                    print(f"Gambar gagal dimuat, beralih ke pesan teks: {img_err}")
+                                    print(f"Gambar gagal dimuat, beralih ke teks: {img_err}")
                             
-                            # Jika gambar gagal/tidak ada, kirim pesan teks biasa agar notifikasi tetap sampai
                             if not terkirim:
                                 try:
                                     bot.send_message(user_id, pesan_notif, parse_mode="Markdown", reply_markup=markup)
                                 except Exception as msg_err:
-                                    print(f"Gagal kirim pesan notif: {msg_err}")
+                                    print(f"Gagal kirim notif: {msg_err}")
                                 
                             cursor.execute("UPDATE user_tracks SET last_chapter = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND url = %s", (chapter_web, user_id, url))
                             conn.commit()
@@ -1423,7 +1455,7 @@ def refresh_loop_multiuser():
 
     cursor.close()
     conn.close()
-
+    
 def loop_background_worker():
     init_db()
     while True:
