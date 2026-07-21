@@ -103,6 +103,13 @@ def edit_dashboard(chat_id, message_id, text, reply_markup=None):
         new_msg = bot.send_message(chat_id, clean_text, reply_markup=reply_markup)
         user_main_message[chat_id] = new_msg.message_id
 
+def ekstrak_nomor_chapter_singkat(title):
+    """Mengekstrak nomor chapter untuk label tombol (Contoh: 'Chapter 44' -> 'Ch 44')"""
+    match = re.search(r'(chapter|ch|bab)[-_ ]?(\d+(\.\d+)?)', title, re.IGNORECASE)
+    if match:
+        return f"Ch {match.group(2)}"
+    return title[:8]
+
 def ekstrak_data_komik(html_text):
     soup = BeautifulSoup(html_text, 'html.parser')
     chapter_terbaru = None
@@ -132,7 +139,7 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url, url_chapter_terbaru
 
 def ekstrak_daftar_chapter(url_manga):
-    """Mengambil daftar chapter dari halaman utama komik (Sangat Stabil & Resilient)"""
+    """Mengambil daftar chapter dari halaman utama komik (Stabil & Anti-Gagal)"""
     scraper = cloudscraper.create_scraper()
     try:
         res = scraper.get(url_manga, timeout=15)
@@ -140,15 +147,13 @@ def ekstrak_daftar_chapter(url_manga):
             return []
             
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 1. Cari container daftar chapter dengan berbagai variasi ID / Class
         container = (
             soup.find(id='Daftar_Chapter') or 
             soup.find(class_='Daftar_Chapter') or 
             soup.find(id='daftar_chapter') or 
             soup.find(id='chapterlist') or 
             soup.find(class_='cl') or
-            soup  # Fallback: Cari di seluruh halaman jika container tidak terdeteksi
+            soup
         )
         
         chapters = []
@@ -157,25 +162,21 @@ def ekstrak_daftar_chapter(url_manga):
             if not href:
                 continue
                 
-            # 2. Filter tautan yang mengarah ke halaman chapter (/ch/ atau /chapter/)
             if '/ch/' in href or 'chapter' in href.lower():
                 if href.startswith('/'):
                     href = f"https://komiku.org{href}"
                 
-                # Biarkan URL valid dari Komiku
                 if any(x in href for x in ['/genre/', '/category/', '/manga/']) and '/ch/' not in href:
                     continue
 
-                # 3. Ambil Judul Chapter
                 title = " ".join(a.text.strip().split())
                 if not title or len(title) < 2:
                     title = a.get('title', '') or href.rstrip('/').split('/')[-1].replace('-', ' ').title()
 
-                # 4. Hindari duplikasi URL
                 if not any(c['url'] == href for c in chapters):
                     chapters.append({'title': title, 'url': href})
         
-        return chapters[:10]  # Ambil 10 chapter teratas
+        return chapters[:10]
     except Exception as e:
         print(f"Error ekstrak chapter list: {e}")
         return []
@@ -218,7 +219,6 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
     max_width = 1000 if quality == "HD" else 700
 
     try:
-        # 1. Download gambar satu per satu ke file sementara di disk
         for idx, url in enumerate(image_urls):
             try:
                 resp = scraper.get(url, headers=headers, timeout=12)
@@ -242,9 +242,8 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
         if not temp_files:
             return None
 
-        temp_files.sort()  # Urutkan urutan halaman
+        temp_files.sort()
 
-        # 2. Gabungkan file JPEG ke PDF menggunakan img2pdf (Zero Memory Overhead)
         pdf_bytes = img2pdf.convert(temp_files)
         pdf_buffer = io.BytesIO(pdf_bytes)
         return pdf_buffer
@@ -254,7 +253,6 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
         return None
 
     finally:
-        # 3. Hapus file temp & paksa pembersihan RAM
         for f in temp_files:
             if os.path.exists(f):
                 try: os.remove(f)
@@ -265,12 +263,11 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
         gc.collect()
 
 def update_last_read_status(user_id, url_chapter):
-    """Mengubah status Terakhir Dibaca berdasarkan pencocokan URL slug komik yang presisi"""
+    """Mengubah status Terakhir Dibaca berdasarkan pencocokan URL slug yang presisi"""
     try:
         slug_ch = url_chapter.rstrip('/').split('/')[-1]
         
-        # 1. Ekstrak nama chapter agar rapi (Contoh: "became-...-chapter-44" -> "Chapter 44")
-        match_ch = re.search(r'(chapter|ch)[-_]?(\d+(\.\d+)?)', slug_ch, re.IGNORECASE)
+        match_ch = re.search(r'(chapter|ch|bab)[-_]?(\d+(\.\d+)?)', slug_ch, re.IGNORECASE)
         if match_ch:
             clean_ch = f"Chapter {match_ch.group(2)}"
         else:
@@ -279,14 +276,11 @@ def update_last_read_status(user_id, url_chapter):
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
 
-        # 2. Ambil semua daftar komik user untuk dicocokkan URL-nya
         cursor.execute("SELECT id, url FROM user_tracks WHERE user_id = %s", (user_id,))
         rows = cursor.fetchall()
 
         for db_id, manga_url in rows:
             manga_slug = manga_url.rstrip('/').split('/')[-1]
-            
-            # Jika slug komik ada di dalam link chapter yang di-download
             if manga_slug and manga_slug in slug_ch:
                 cursor.execute(
                     "UPDATE user_tracks SET last_read = %s WHERE id = %s",
@@ -666,22 +660,55 @@ def callback_router(call):
                 return
 
             user_chapter_storage[user_id] = chapters
-            pesan = f"📖 *PILIH CHAPTER DARI {bersihkan_markdown(manga_title).upper()}:*\n───────────────────────────\n"
-            for idx, ch in enumerate(chapters, 1):
-                pesan += f"{idx}. `{bersihkan_markdown(ch['title'])}`\n"
+            user_selected_manga[user_id] = db_id
+
+            pesan = (
+                f"📖 *PILIH CHAPTER KOMIK:*\n"
+                f"📌 *{bersihkan_markdown(manga_title)}*\n"
+                f"───────────────────────────\n"
+                f"Klik tombol chapter di bawah ini atau gunakan tombol **Input Nomor Chapter**:"
+            )
 
             markup = telebot.types.InlineKeyboardMarkup()
             row_buttons = []
-            for idx in range(len(chapters)):
-                row_buttons.append(telebot.types.InlineKeyboardButton(text=f" Ch {idx+1} ", callback_data=f"exec_dl_ch_{idx}"))
-                if len(row_buttons) == 4:
+            for idx, ch in enumerate(chapters):
+                label_ch = ekstrak_nomor_chapter_singkat(ch['title'])
+                row_buttons.append(telebot.types.InlineKeyboardButton(text=label_ch, callback_data=f"exec_dl_ch_{idx}"))
+                if len(row_buttons) == 3:
                     markup.row(*row_buttons)
                     row_buttons = []
             if row_buttons:
                 markup.row(*row_buttons)
 
+            markup.row(
+                telebot.types.InlineKeyboardButton(text="✏️ Input Nomor Chapter", callback_data="btn_input_custom_ch"),
+                telebot.types.InlineKeyboardButton(text="⏮️ Chapter 1", callback_data=f"exec_dl_ch1_{db_id}")
+            )
             markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Pilih Komik", callback_data="manage_dl_chapter"))
             edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data == "btn_input_custom_ch":
+            bot.answer_callback_query(call.id)
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Batal", callback_data="manage_dl_chapter"))
+            edit_dashboard(user_id, msg_id, "✏️ **Ketik NOMOR CHAPTER** yang ingin kamu unduh:\n\n*Contoh:* `1`, `12`, `45`, atau `10.5`", markup)
+            bot.register_next_step_handler_by_chat_id(user_id, tangkap_input_nomor_chapter)
+
+        elif call.data.startswith("exec_dl_ch1_"):
+            db_id = int(call.data.split('_')[3])
+            bot.answer_callback_query(call.id, "⚡ Mengunduh Chapter 1...", show_alert=False)
+            
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if res:
+                slug = res[0].rstrip('/').split('/')[-1]
+                url_ch1 = f"https://komiku.org/ch/{slug}-chapter-1/"
+                eksekusi_unduh_pdf(user_id, url_ch1, status_msg_id=msg_id)
 
         elif call.data.startswith("exec_dl_ch_"):
             ch_idx = int(call.data.split('_')[3])
@@ -812,6 +839,36 @@ def callback_router(call):
 # =========================================================================
 # 📥 NEXT STEP HANDLERS
 # =========================================================================
+
+def tangkap_input_nomor_chapter(message):
+    user_id = message.chat.id
+    ch_num = message.text.strip().lower().replace('chapter', '').replace('ch', '').strip()
+    msg_dashboard_id = user_main_message.get(user_id)
+    db_id = user_selected_manga.get(user_id)
+    
+    try: bot.delete_message(user_id, message.message_id)
+    except: pass
+
+    if not db_id:
+        bot.send_message(user_id, "❌ Sesi telah kedaluwarsa, silakan pilih ulang komik.")
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT title, url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+    res = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not res:
+        bot.send_message(user_id, "❌ Komik tidak ditemukan di database.")
+        return
+
+    manga_title, manga_url = res
+    slug = manga_url.rstrip('/').split('/')[-1]
+    
+    url_target = f"https://komiku.org/ch/{slug}-chapter-{ch_num}/"
+    eksekusi_unduh_pdf(user_id, url_target, status_msg_id=msg_dashboard_id)
 
 def tangkap_manual_progress_input(message):
     user_id = message.chat.id
