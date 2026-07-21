@@ -131,24 +131,50 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url, url_chapter_terbaru
 
 def ekstrak_daftar_chapter(url_manga):
+    """Mengambil daftar chapter dari halaman utama komik (Sangat Stabil & Resilient)"""
     scraper = cloudscraper.create_scraper()
     try:
-        res = scraper.get(url_manga, timeout=12)
+        res = scraper.get(url_manga, timeout=15)
         if res.status_code != 200:
             return []
+            
         soup = BeautifulSoup(res.text, 'html.parser')
-        container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter') or soup.find(id='chapterlist') or soup.find(class_='cl')
+        
+        # 1. Cari container daftar chapter dengan berbagai variasi ID / Class
+        container = (
+            soup.find(id='Daftar_Chapter') or 
+            soup.find(class_='Daftar_Chapter') or 
+            soup.find(id='daftar_chapter') or 
+            soup.find(id='chapterlist') or 
+            soup.find(class_='cl') or
+            soup  # Fallback: Cari di seluruh halaman jika container tidak terdeteksi
+        )
+        
         chapters = []
-        if container:
-            for a in container.find_all('a'):
-                href = a.get('href', '')
+        for a in container.find_all('a'):
+            href = a.get('href', '')
+            if not href:
+                continue
+                
+            # 2. Filter tautan yang mengarah ke halaman chapter (/ch/ atau /chapter/)
+            if '/ch/' in href or 'chapter' in href.lower():
+                if href.startswith('/'):
+                    href = f"https://komiku.org{href}"
+                
+                # Biarkan URL valid dari Komiku
+                if any(x in href for x in ['/genre/', '/category/', '/manga/']) and '/ch/' not in href:
+                    continue
+
+                # 3. Ambil Judul Chapter
                 title = " ".join(a.text.strip().split())
-                if href and title and ('/ch/' in href or '/chapter/' in href):
-                    if href.startswith('/'):
-                        href = f"https://komiku.org{href}"
-                    if not any(c['url'] == href for c in chapters):
-                        chapters.append({'title': title, 'url': href})
-        return chapters[:10]
+                if not title or len(title) < 2:
+                    title = a.get('title', '') or href.rstrip('/').split('/')[-1].replace('-', ' ').title()
+
+                # 4. Hindari duplikasi URL
+                if not any(c['url'] == href for c in chapters):
+                    chapters.append({'title': title, 'url': href})
+        
+        return chapters[:10]  # Ambil 10 chapter teratas
     except Exception as e:
         print(f"Error ekstrak chapter list: {e}")
         return []
