@@ -30,7 +30,8 @@ telebot.apihelper.CONNECT_TIMEOUT = 30
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_main_message = {}
 user_quality_pref = {}
-user_selected_manga = {} # Sesi temporary untuk set progress manual
+user_selected_manga = {}     # Temporary session progress
+user_chapter_storage = {}    # Temporary storage daftar chapter komik
 
 # =========================================================================
 # 🗄️ DATABASE INITIALIZATION & MIGRATION
@@ -125,6 +126,30 @@ def ekstrak_data_komik(html_text):
         url_chapter_terbaru = f"https://komiku.org{url_chapter_terbaru}"
 
     return chapter_terbaru, image_url, url_chapter_terbaru
+
+def ekstrak_daftar_chapter(url_manga):
+    """Mengekstrak daftar chapter komik dari web profil Komiku"""
+    scraper = cloudscraper.create_scraper()
+    try:
+        res = scraper.get(url_manga, timeout=12)
+        if res.status_code != 200:
+            return []
+        soup = BeautifulSoup(res.text, 'html.parser')
+        container = soup.find(id='Daftar_Chapter') or soup.find(id='daftar_chapter') or soup.find(id='chapterlist') or soup.find(class_='cl')
+        chapters = []
+        if container:
+            for a in container.find_all('a'):
+                href = a.get('href', '')
+                title = " ".join(a.text.strip().split())
+                if href and title and ('/ch/' in href or '/chapter/' in href):
+                    if href.startswith('/'):
+                        href = f"https://komiku.org{href}"
+                    if not any(c['url'] == href for c in chapters):
+                        chapters.append({'title': title, 'url': href})
+        return chapters[:10]  # Mengambil 10 chapter teratas/terbaru
+    except Exception as e:
+        print(f"Error ekstrak chapter list: {e}")
+        return []
 
 def ekstrak_gambar_chapter(url_chapter):
     scraper = cloudscraper.create_scraper()
@@ -404,30 +429,7 @@ def callback_router(call):
             edit_dashboard(user_id, msg_id, "📥 Silakan **upload file `.json`** hasil backup kamu:", markup)
             bot.register_next_step_handler_by_chat_id(user_id, tangkap_file_import)
 
-        elif call.data.startswith("dln_"):
-            db_id = int(call.data.split('_')[1])
-            bot.answer_callback_query(call.id, "⚡ Memulai pengunduhan PDF...", show_alert=False)
-            conn = psycopg2.connect(DATABASE_URL)
-            cursor = conn.cursor()
-            cursor.execute("SELECT url FROM user_tracks WHERE id = %s", (db_id,))
-            res = cursor.fetchone()
-            cursor.close()
-            conn.close()
-
-            if res:
-                manga_url = res[0]
-                scraper = cloudscraper.create_scraper()
-                try:
-                    resp = scraper.get(manga_url, timeout=12)
-                    _, _, latest_ch_url = ekstrak_data_komik(resp.text)
-                    if latest_ch_url:
-                        eksekusi_unduh_pdf(user_id, latest_ch_url)
-                    else:
-                        bot.send_message(user_id, "❌ Gagal mendapatkan link chapter terbaru.")
-                except Exception as e:
-                    bot.send_message(user_id, f"❌ Error: {e}")
-
-        elif call.data == "btn_daftar": # DAFTAR TRACKER (MURNI UNTUK AUTOSCAN UPDATE)
+        elif call.data == "btn_daftar":  # DAFTAR TRACKER
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -457,12 +459,63 @@ def callback_router(call):
             pesan += f"───────────────────────────\n💡 Radar siaga memantau update komik 24/7."
             markup = telebot.types.InlineKeyboardMarkup()
             markup.row(
-                telebot.types.InlineKeyboardButton(text="🗑️ Hapus Tracker", callback_data="manage_del"),
-                telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home")
+                telebot.types.InlineKeyboardButton(text="⚡ Download Chapter Terbaru", callback_data="manage_dl_latest"),
+                telebot.types.InlineKeyboardButton(text="🗑️ Hapus Tracker", callback_data="manage_del")
             )
+            markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data == "btn_bacaan": # DAFTAR BACAAN (UNTUK MANAJEMEN PROGRESS BACA)
+        elif call.data == "manage_dl_latest":  # CHOOSE MANGA TO DOWNLOAD LATEST CH
+            bot.answer_callback_query(call.id)
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
+            data = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            pesan = "⚡ *PILIH KOMIK UNTUK UNDUH CHAPTER TERBARU:*\n───────────────────────────\n"
+            for idx, (db_id, title) in enumerate(data, 1):
+                pesan += f" [{idx}]  *{bersihkan_markdown(title)}*\n"
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            row_buttons = []
+            for idx, (db_id, title) in enumerate(data, 1):
+                row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"exec_dl_lat_{db_id}"))
+                if len(row_buttons) == 5:
+                    markup.row(*row_buttons)
+                    row_buttons = []
+            if row_buttons:
+                markup.row(*row_buttons)
+
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Tracker", callback_data="btn_daftar"))
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data.startswith("exec_dl_lat_"):  # EXECUTE DOWNLOAD LATEST
+            db_id = int(call.data.split('_')[3])
+            bot.answer_callback_query(call.id, "⚡ Mengambil link chapter terbaru...", show_alert=False)
+            
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if res:
+                manga_url = res[0]
+                scraper = cloudscraper.create_scraper()
+                try:
+                    resp = scraper.get(manga_url, timeout=12)
+                    _, _, latest_ch_url = ekstrak_data_komik(resp.text)
+                    if latest_ch_url:
+                        eksekusi_unduh_pdf(user_id, latest_ch_url, status_msg_id=msg_id)
+                    else:
+                        bot.send_message(user_id, "❌ Gagal mengunduh link chapter terbaru.")
+                except Exception as e:
+                    bot.send_message(user_id, f"❌ Error: {e}")
+
+        elif call.data == "btn_bacaan":  # DAFTAR BACAAN
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -489,15 +542,91 @@ def callback_router(call):
                     f"     ⚡ Status Web Saat Ini: `{clean_last_ch}`\n\n"
                 )
                 
-            pesan += f"───────────────────────────\n💡 Klik 'Set Manual Progress' untuk memperbarui chapter bacaanmu."
+            pesan += f"───────────────────────────\n💡 Pilih menu di bawah untuk unduh chapter atau set progress."
             markup = telebot.types.InlineKeyboardMarkup()
             markup.row(
-                telebot.types.InlineKeyboardButton(text="✏️ Set Manual Progress", callback_data="manage_read_progress"),
-                telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home")
+                telebot.types.InlineKeyboardButton(text="📥 Download Chapter", callback_data="manage_dl_chapter"),
+                telebot.types.InlineKeyboardButton(text="✏️ Set Manual Progress", callback_data="manage_read_progress")
             )
+            markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data == "manage_read_progress": # PILIH KOMIK UNTUK EDIT PROGRESS BACA
+        elif call.data == "manage_dl_chapter":  # PILIH KOMIK UNTUK CHOOSE CHAPTER
+            bot.answer_callback_query(call.id)
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title FROM user_tracks WHERE user_id = %s ORDER BY id DESC", (user_id,))
+            data = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            pesan = "📥 *PILIH KOMIK YANG INGIN DIUNDUH CHAPTER-NYA:*\n───────────────────────────\n"
+            for idx, (db_id, title) in enumerate(data, 1):
+                pesan += f" [{idx}]  *{bersihkan_markdown(title)}*\n"
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            row_buttons = []
+            for idx, (db_id, title) in enumerate(data, 1):
+                row_buttons.append(telebot.types.InlineKeyboardButton(text=f" [{idx}] ", callback_data=f"sel_manga_ch_{db_id}"))
+                if len(row_buttons) == 5:
+                    markup.row(*row_buttons)
+                    row_buttons = []
+            if row_buttons:
+                markup.row(*row_buttons)
+
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Daftar Bacaan", callback_data="btn_bacaan"))
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data.startswith("sel_manga_ch_"):  # FETCH & DISPLAY LIST OF CHAPTERS
+            db_id = int(call.data.split('_')[3])
+            bot.answer_callback_query(call.id, "⏳ Mengambil daftar chapter dari web...", show_alert=False)
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, url FROM user_tracks WHERE id = %s AND user_id = %s", (db_id, user_id))
+            res = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if not res:
+                bot.send_message(user_id, "❌ Data komik tidak ditemukan.")
+                return
+
+            manga_title, manga_url = res
+            chapters = ekstrak_daftar_chapter(manga_url)
+            if not chapters:
+                bot.send_message(user_id, "❌ Gagal memuat daftar chapter komik ini.")
+                return
+
+            user_chapter_storage[user_id] = chapters
+            pesan = f"📖 *PILIH CHAPTER DARI {bersihkan_markdown(manga_title).upper()}:*\n───────────────────────────\n"
+            for idx, ch in enumerate(chapters, 1):
+                pesan += f"{idx}. `{bersihkan_markdown(ch['title'])}`\n"
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            row_buttons = []
+            for idx in range(len(chapters)):
+                row_buttons.append(telebot.types.InlineKeyboardButton(text=f" Ch {idx+1} ", callback_data=f"exec_dl_ch_{idx}"))
+                if len(row_buttons) == 4:
+                    markup.row(*row_buttons)
+                    row_buttons = []
+            if row_buttons:
+                markup.row(*row_buttons)
+
+            markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Pilih Komik", callback_data="manage_dl_chapter"))
+            edit_dashboard(user_id, msg_id, pesan, markup)
+
+        elif call.data.startswith("exec_dl_ch_"):  # DOWNLOAD SELECTED CHAPTER
+            ch_idx = int(call.data.split('_')[3])
+            bot.answer_callback_query(call.id, "⚡ Memproses pengunduhan PDF...", show_alert=False)
+
+            if user_id in user_chapter_storage and ch_idx < len(user_chapter_storage[user_id]):
+                target_ch = user_chapter_storage[user_id][ch_idx]
+                eksekusi_unduh_pdf(user_id, target_ch['url'], status_msg_id=msg_id)
+            else:
+                bot.send_message(user_id, "❌ Sesi pilihan chapter kedaluwarsa, silakan pilih ulang.")
+
+        elif call.data == "manage_read_progress":  # EDIT PROGRESS BACA
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
