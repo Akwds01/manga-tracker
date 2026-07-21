@@ -3,6 +3,7 @@ import io
 import time
 import json
 import gc
+import re
 import tempfile
 import requests
 from bs4 import BeautifulSoup
@@ -263,17 +264,39 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
             except: pass
         gc.collect()
 
+import re
+
 def update_last_read_status(user_id, url_chapter):
+    """Mengubah status Terakhir Dibaca berdasarkan pencocokan URL slug komik yang presisi"""
     try:
-        clean_ch = url_chapter.rstrip('/').split('/')[-1].replace('-', ' ').title()
+        slug_ch = url_chapter.rstrip('/').split('/')[-1]
+        
+        # 1. Ekstrak nama chapter agar rapi (Contoh: "became-...-chapter-44" -> "Chapter 44")
+        match_ch = re.search(r'(chapter|ch)[-_]?(\d+(\.\d+)?)', slug_ch, re.IGNORECASE)
+        if match_ch:
+            clean_ch = f"Chapter {match_ch.group(2)}"
+        else:
+            clean_ch = slug_ch.replace('-', ' ').title()
+
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE user_tracks 
-            SET last_read = %s 
-            WHERE user_id = %s AND %s LIKE '%' || LOWER(REPLACE(title, ' ', '-')) || '%';
-        """, (clean_ch, user_id, url_chapter.lower()))
-        conn.commit()
+
+        # 2. Ambil semua daftar komik user untuk dicocokkan URL-nya
+        cursor.execute("SELECT id, url FROM user_tracks WHERE user_id = %s", (user_id,))
+        rows = cursor.fetchall()
+
+        for db_id, manga_url in rows:
+            manga_slug = manga_url.rstrip('/').split('/')[-1]
+            
+            # Jika slug komik ada di dalam link chapter yang di-download
+            if manga_slug and manga_slug in slug_ch:
+                cursor.execute(
+                    "UPDATE user_tracks SET last_read = %s WHERE id = %s",
+                    (clean_ch, db_id)
+                )
+                conn.commit()
+                break
+
         cursor.close()
         conn.close()
     except Exception as e:
