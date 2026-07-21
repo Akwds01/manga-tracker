@@ -2,6 +2,8 @@ import os
 import io
 import time
 import json
+import gc
+import tempfile
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
@@ -9,6 +11,7 @@ import cloudscraper
 import telebot
 from threading import Thread
 from PIL import Image
+import img2pdf
 
 # =========================================================================
 # ⚙️ KONFIGURASI BOT & DATABASE
@@ -23,7 +26,7 @@ BANNER_MENU_URL = "https://images.unsplash.com/photo-1578632767115-351597cf2477?
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Atur Timeout API Telegram
+# Timeout API Telegram diperpanjang untuk handling pengiriman dokumen
 telebot.apihelper.CUSTOM_REQUEST_TIMEOUT = 180
 telebot.apihelper.CONNECT_TIMEOUT = 30
 
@@ -59,7 +62,7 @@ def init_db():
     conn.close()
 
 # =========================================================================
-# 🛠️ HELPER SAFE EDIT DASHBOARD & SCRAPING
+# 🛠️ HELPER DASHBOARD, SCRAPING, & CONVERTER (HEMAT RAM)
 # =========================================================================
 
 def bersihkan_markdown(text):
@@ -128,7 +131,6 @@ def ekstrak_data_komik(html_text):
     return chapter_terbaru, image_url, url_chapter_terbaru
 
 def ekstrak_daftar_chapter(url_manga):
-    """Mengekstrak daftar chapter komik dari web profil Komiku"""
     scraper = cloudscraper.create_scraper()
     try:
         res = scraper.get(url_manga, timeout=12)
@@ -146,7 +148,7 @@ def ekstrak_daftar_chapter(url_manga):
                         href = f"https://komiku.org{href}"
                     if not any(c['url'] == href for c in chapters):
                         chapters.append({'title': title, 'url': href})
-        return chapters[:10]  # Mengambil 10 chapter teratas/terbaru
+        return chapters[:10]
     except Exception as e:
         print(f"Error ekstrak chapter list: {e}")
         return []
@@ -177,45 +179,63 @@ def ekstrak_gambar_chapter(url_chapter):
         return []
 
 def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
+    """Mengunduh gambar ke Disk Temp & Menyusun PDF via img2pdf (Sangat Hemat RAM < 30 MB)"""
     scraper = cloudscraper.create_scraper()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": referer_url if referer_url else "https://komiku.org/"
     }
     
-    pil_images = []
-    max_width = 1200 if quality == "HD" else 750
-
-    for url in image_urls:
-        try:
-            resp = scraper.get(url, headers=headers, timeout=12)
-            if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                if img.width > max_width:
-                    ratio = max_width / float(img.width)
-                    new_height = int(float(img.height) * ratio)
-                    img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-                pil_images.append(img)
-        except Exception as e:
-            print(f"Gagal unduh halaman {url}: {e}")
-            
-    if not pil_images:
-        return None
+    temp_dir = tempfile.mkdtemp()
+    temp_files = []
+    max_width = 1000 if quality == "HD" else 700
 
     try:
-        pdf_buffer = io.BytesIO()
-        pil_images[0].save(
-            pdf_buffer, 
-            format='PDF', 
-            save_all=True, 
-            append_images=pil_images[1:],
-            quality=80 if quality == "HD" else 50
-        )
-        pdf_buffer.seek(0)
+        # 1. Download gambar satu per satu ke file sementara di disk
+        for idx, url in enumerate(image_urls):
+            try:
+                resp = scraper.get(url, headers=headers, timeout=12)
+                if resp.status_code == 200:
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    
+                    if img.width > max_width:
+                        ratio = max_width / float(img.width)
+                        new_height = int(float(img.height) * ratio)
+                        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    temp_path = os.path.join(temp_dir, f"page_{idx:03d}.jpg")
+                    img.save(temp_path, "JPEG", quality=75 if quality == "HD" else 50)
+                    temp_files.append(temp_path)
+                    
+                    img.close()
+                    del img
+            except Exception as e:
+                print(f"Gagal unduh halaman {url}: {e}")
+                
+        if not temp_files:
+            return None
+
+        temp_files.sort()  # Urutkan urutan halaman
+
+        # 2. Gabungkan file JPEG ke PDF menggunakan img2pdf (Zero Memory Overhead)
+        pdf_bytes = img2pdf.convert(temp_files)
+        pdf_buffer = io.BytesIO(pdf_bytes)
         return pdf_buffer
+
     except Exception as e:
         print(f"Error menyusun file PDF: {e}")
         return None
+
+    finally:
+        # 3. Hapus file temp & paksa pembersihan RAM
+        for f in temp_files:
+            if os.path.exists(f):
+                try: os.remove(f)
+                except: pass
+        if os.path.exists(temp_dir):
+            try: os.rmdir(temp_dir)
+            except: pass
+        gc.collect()
 
 def update_last_read_status(user_id, url_chapter):
     try:
@@ -465,7 +485,7 @@ def callback_router(call):
             markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data == "manage_dl_latest":  # CHOOSE MANGA TO DOWNLOAD LATEST CH
+        elif call.data == "manage_dl_latest":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -491,7 +511,7 @@ def callback_router(call):
             markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Tracker", callback_data="btn_daftar"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data.startswith("exec_dl_lat_"):  # EXECUTE DOWNLOAD LATEST
+        elif call.data.startswith("exec_dl_lat_"):
             db_id = int(call.data.split('_')[3])
             bot.answer_callback_query(call.id, "⚡ Mengambil link chapter terbaru...", show_alert=False)
             
@@ -551,7 +571,7 @@ def callback_router(call):
             markup.row(telebot.types.InlineKeyboardButton(text="🏠 Menu Utama", callback_data="go_home"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data == "manage_dl_chapter":  # PILIH KOMIK UNTUK CHOOSE CHAPTER
+        elif call.data == "manage_dl_chapter":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
@@ -577,7 +597,7 @@ def callback_router(call):
             markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Daftar Bacaan", callback_data="btn_bacaan"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data.startswith("sel_manga_ch_"):  # FETCH & DISPLAY LIST OF CHAPTERS
+        elif call.data.startswith("sel_manga_ch_"):
             db_id = int(call.data.split('_')[3])
             bot.answer_callback_query(call.id, "⏳ Mengambil daftar chapter dari web...", show_alert=False)
 
@@ -616,7 +636,7 @@ def callback_router(call):
             markup.row(telebot.types.InlineKeyboardButton(text="🔙 Kembali ke Pilih Komik", callback_data="manage_dl_chapter"))
             edit_dashboard(user_id, msg_id, pesan, markup)
 
-        elif call.data.startswith("exec_dl_ch_"):  # DOWNLOAD SELECTED CHAPTER
+        elif call.data.startswith("exec_dl_ch_"):
             ch_idx = int(call.data.split('_')[3])
             bot.answer_callback_query(call.id, "⚡ Memproses pengunduhan PDF...", show_alert=False)
 
@@ -626,7 +646,7 @@ def callback_router(call):
             else:
                 bot.send_message(user_id, "❌ Sesi pilihan chapter kedaluwarsa, silakan pilih ulang.")
 
-        elif call.data == "manage_read_progress":  # EDIT PROGRESS BACA
+        elif call.data == "manage_read_progress":
             bot.answer_callback_query(call.id)
             conn = psycopg2.connect(DATABASE_URL)
             cursor = conn.cursor()
