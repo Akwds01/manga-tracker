@@ -264,8 +264,6 @@ def buat_pdf_dari_gambar(image_urls, referer_url=None, quality="HD"):
             except: pass
         gc.collect()
 
-import re
-
 def update_last_read_status(user_id, url_chapter):
     """Mengubah status Terakhir Dibaca berdasarkan pencocokan URL slug komik yang presisi"""
     try:
