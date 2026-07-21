@@ -27,8 +27,8 @@ BANNER_MENU_URL = "https://images.unsplash.com/photo-1578632767115-351597cf2477?
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-telebot.apihelper.CUSTOM_REQUEST_TIMEOUT = 180
-telebot.apihelper.CONNECT_TIMEOUT = 30
+telebot.apihelper.CUSTOM_REQUEST_TIMEOUT = 300
+telebot.apihelper.CONNECT_TIMEOUT = 60
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_main_message = {}
@@ -363,7 +363,7 @@ def eksekusi_unduh_pdf(chat_id, url_chapter, status_msg_id=None):
             caption=f"✅ *Download PDF Selesai!*\n📖 `{judul_file}`\n⚡ Mode Kualitas: `{quality}`",
             parse_mode="Markdown",
             reply_markup=markup_next,
-            timeout=180
+            timeout=300
         )
         update_last_read_status(chat_id, url_chapter)
 
